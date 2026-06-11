@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import threading
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QObject, QProcess, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFileSystemModel,
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -30,12 +34,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .editor import MarkdownEditor
 from .folder_search import search_markdown_files
 from .icon import app_icon
 from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
 from .settings import APP_NAME, SUPPORTED_EXTENSIONS, TECHNICAL_DIRS, AppSettings
+from .updater import INSTALLER_ASSET, UpdateInfo, can_self_install, check_for_update, download_asset
 from .web_page import MarkdownWebPage
+
+
+class _UpdateSignals(QObject):
+    """Bridges background update threads back to the GUI thread via queued signals."""
+
+    check_done = Signal(object)  # UpdateInfo | None
+    check_failed = Signal(str)
+    progress = Signal(int)
+    download_done = Signal(str)  # path to downloaded installer
+    download_failed = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +147,116 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
         self._update_history_actions()
         self._show_welcome()
+
+        self._init_updates()
+
+    # ----------------------------------------------------------------- updates
+
+    def _init_updates(self) -> None:
+        self._update_in_progress = False
+        self._update_silent = True
+        self._latest_update: UpdateInfo | None = None
+
+        self._update_progress = QProgressBar(self)
+        self._update_progress.setRange(0, 100)
+        self._update_progress.setMaximumWidth(220)
+        self._update_progress.setTextVisible(True)
+        self._update_progress.hide()
+        self.statusBar().addPermanentWidget(self._update_progress)
+
+        self._update_signals = _UpdateSignals()
+        self._update_signals.check_done.connect(self._on_update_checked)
+        self._update_signals.check_failed.connect(self._on_update_check_failed)
+        self._update_signals.progress.connect(self._update_progress.setValue)
+        self._update_signals.download_done.connect(self._on_update_downloaded)
+        self._update_signals.download_failed.connect(self._on_update_download_failed)
+
+        if self.settings.check_updates_on_start:
+            # Defer so the window paints first; the check runs off the GUI thread.
+            QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self._update_silent = silent
+        if not silent:
+            self.statusBar().showMessage("Проверка обновлений…", 4000)
+        threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def _run_update_check(self) -> None:
+        try:
+            info = check_for_update(__version__)
+        except Exception as exc:  # noqa: BLE001 - any failure is reported to the UI
+            self._update_signals.check_failed.emit(str(exc))
+        else:
+            self._update_signals.check_done.emit(info)
+
+    def _on_update_checked(self, info: object) -> None:
+        if info is None:
+            self._update_in_progress = False
+            if not self._update_silent:
+                QMessageBox.information(
+                    self,
+                    "Обновления",
+                    f"У вас последняя версия MD Reader ({__version__}).",
+                )
+            return
+
+        self._latest_update = info  # type: ignore[assignment]
+        if can_self_install() and info.asset_url:  # type: ignore[attr-defined]
+            # Apply automatically in the background, no prompts.
+            self._start_update_download(info)  # type: ignore[arg-type]
+        else:
+            # From source or no installer asset: just point at the release page.
+            self._update_in_progress = False
+            self.statusBar().showMessage(f"Доступна версия {info.tag}", 8000)  # type: ignore[attr-defined]
+            if not self._update_silent:
+                QDesktopServices.openUrl(QUrl(info.html_url))  # type: ignore[attr-defined]
+
+    def _on_update_check_failed(self, message: str) -> None:
+        self._update_in_progress = False
+        if not self._update_silent:
+            self._error("Не удалось проверить обновления", message)
+
+    def _start_update_download(self, info: UpdateInfo) -> None:
+        dest = str(Path(tempfile.gettempdir()) / (info.asset_name or INSTALLER_ASSET))
+        self._update_progress.setValue(0)
+        self._update_progress.setFormat(f"Обновление {info.tag} — %p%")
+        self._update_progress.show()
+        self.statusBar().showMessage(f"Загрузка обновления MD Reader {info.tag}…")
+        threading.Thread(
+            target=self._run_update_download,
+            args=(info.asset_url, dest),
+            daemon=True,
+        ).start()
+
+    def _run_update_download(self, url: str, dest: str) -> None:
+        try:
+            download_asset(url, Path(dest), progress=self._update_signals.progress.emit)
+        except Exception as exc:  # noqa: BLE001
+            self._update_signals.download_failed.emit(str(exc))
+        else:
+            self._update_signals.download_done.emit(dest)
+
+    def _on_update_downloaded(self, path: str) -> None:
+        self._update_progress.hide()
+        self.statusBar().showMessage("Установка обновления…")
+        # Launch the installer silently and quit so it can replace running files.
+        started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
+        self._update_in_progress = False
+        if started:
+            QTimer.singleShot(200, QApplication.quit)
+        else:
+            self._error("Не удалось запустить установщик обновления", path)
+
+    def _on_update_download_failed(self, message: str) -> None:
+        self._update_progress.hide()
+        self._update_in_progress = False
+        if not self._update_silent:
+            self._error("Не удалось загрузить обновление", message)
+        else:
+            self.statusBar().showMessage("Не удалось загрузить обновление", 6000)
 
     # ------------------------------------------------------------------ open
 
@@ -249,6 +375,9 @@ class MainWindow(QMainWindow):
         self.zoom_reset_action.setShortcut(QKeySequence("Ctrl+0"))
         self.zoom_reset_action.triggered.connect(self.zoom_reset)
 
+        self.update_action = QAction("Проверить обновления", self)
+        self.update_action.triggered.connect(lambda: self.check_for_updates(silent=False))
+
         self.about_action = QAction("О программе", self)
         self.about_action.triggered.connect(self._show_about)
 
@@ -279,6 +408,8 @@ class MainWindow(QMainWindow):
         search_menu.addAction(self.folder_search_action)
 
         help_menu = self.menuBar().addMenu("Справка")
+        help_menu.addAction(self.update_action)
+        help_menu.addSeparator()
         help_menu.addAction(self.about_action)
 
     def _create_toolbar(self) -> None:
@@ -298,6 +429,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.zoom_out_action)
         toolbar.addAction(self.zoom_reset_action)
         toolbar.addAction(self.zoom_in_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.update_action)
         self.addToolBar(toolbar)
 
     def _create_tray(self) -> None:
@@ -692,7 +825,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "О программе",
-            "MD Reader\n\nПростой просмотрщик и редактор Markdown-файлов и локальных wiki.",
+            f"MD Reader {__version__}\n\nПростой просмотрщик и редактор Markdown-файлов и локальных wiki.",
         )
 
     def _error(self, title: str, text: str) -> None:

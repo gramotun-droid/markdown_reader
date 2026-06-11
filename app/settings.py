@@ -16,6 +16,7 @@ class AppSettings:
     zoom_factor: float = 1.0
     theme: str = "light"
     recent_files: list[Path] = field(default_factory=list)
+    check_updates_on_start: bool = True
 
     @classmethod
     def load(cls) -> AppSettings:
@@ -26,6 +27,7 @@ class AppSettings:
         raw_zoom = settings.value("zoom_factor", 1.0, float)
         theme = settings.value("theme", "light", str)
         raw_recent = settings.value("recent_files", [], list) or []
+        check_updates = settings.value("check_updates_on_start", True, bool)
 
         last_path = Path(raw_last_path) if raw_last_path else None
         zoom_factor = float(raw_zoom or 1.0)
@@ -42,6 +44,7 @@ class AppSettings:
             zoom_factor=zoom_factor,
             theme=theme,
             recent_files=recent_files,
+            check_updates_on_start=bool(check_updates),
         )
 
     def save(self) -> None:
@@ -52,6 +55,7 @@ class AppSettings:
         settings.setValue("zoom_factor", self.zoom_factor)
         settings.setValue("theme", self.theme)
         settings.setValue("recent_files", [str(path) for path in self.recent_files])
+        settings.setValue("check_updates_on_start", self.check_updates_on_start)
 
     def remember_recent(self, path: Path) -> None:
         resolved = path.resolve()
