@@ -27,10 +27,13 @@ body {
 
 .markdown-body {
   max-width: 980px;
-  min-height: 100vh;
-  margin: 0 auto;
-  padding: 44px 48px 80px;
+  min-height: calc(100vh - 48px);
+  margin: 24px auto;
+  padding: 48px 56px 80px;
   background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 14px 36px rgba(0, 0, 0, 0.32);
 }
 
 h1,
@@ -79,6 +82,7 @@ a {
 
 a:hover {
   text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 ul,
@@ -91,7 +95,8 @@ blockquote {
   padding: 0.75rem 1rem;
   color: var(--muted);
   background: var(--quote-bg);
-  border-left: 4px solid #637083;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
 }
 
 hr {
@@ -124,6 +129,11 @@ td {
 
 th {
   background: var(--table-head);
+  font-weight: 650;
+}
+
+tbody tr:nth-child(even) {
+  background: var(--quote-bg);
 }
 
 code {

@@ -28,13 +28,13 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QSystemTrayIcon,
-    QToolBar,
     QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
+from .drives import available_roots
 from .editor import MarkdownEditor
 from .folder_search import search_markdown_files
 from .icon import app_icon
@@ -142,8 +142,8 @@ class MainWindow(QMainWindow):
 
         self._create_actions()
         self._create_menus()
-        self._create_toolbar()
         self._create_tray()
+        self._apply_app_style()
         self._rebuild_recent_menu()
         self._update_history_actions()
         self._show_welcome()
@@ -385,6 +385,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("Файл")
         file_menu.addAction(self.open_file_action)
         file_menu.addAction(self.open_folder_action)
+        self.drives_menu = file_menu.addMenu("Диски")
+        self.drives_menu.aboutToShow.connect(lambda: self._populate_drives_menu(self.drives_menu))
         self.recent_menu = file_menu.addMenu("Недавние файлы")
         file_menu.addSeparator()
         file_menu.addAction(self.edit_action)
@@ -412,26 +414,20 @@ class MainWindow(QMainWindow):
         help_menu.addSeparator()
         help_menu.addAction(self.about_action)
 
-    def _create_toolbar(self) -> None:
-        toolbar = QToolBar("Основные действия", self)
-        toolbar.setMovable(False)
-        toolbar.addAction(self.open_file_action)
-        toolbar.addAction(self.open_folder_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.back_action)
-        toolbar.addAction(self.forward_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.edit_action)
-        toolbar.addAction(self.find_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.theme_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.zoom_out_action)
-        toolbar.addAction(self.zoom_reset_action)
-        toolbar.addAction(self.zoom_in_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.update_action)
-        self.addToolBar(toolbar)
+    def _populate_drives_menu(self, menu: QMenu) -> None:
+        # Rebuilt on every open so mounting a drive/WSL distro shows up live.
+        menu.clear()
+        try:
+            roots = available_roots()
+        except Exception:  # noqa: BLE001 - drive enumeration must never crash the UI
+            roots = []
+        if not roots:
+            empty = menu.addAction("Диски не найдены")
+            empty.setEnabled(False)
+            return
+        for label, path in roots:
+            action = menu.addAction(label)
+            action.triggered.connect(partial(self.open_folder, Path(path)))
 
     def _create_tray(self) -> None:
         self.tray: QSystemTrayIcon | None = None
@@ -439,14 +435,26 @@ class MainWindow(QMainWindow):
             return
         self.tray = QSystemTrayIcon(app_icon(), self)
         self.tray.setToolTip(APP_NAME)
-        menu = QMenu(self)
+
         show_action = QAction("Показать окно", self)
         show_action.triggered.connect(self._restore_window)
         quit_action = QAction("Выход", self)
         quit_action.triggered.connect(self.close)
+
+        # The tray menu mirrors the main actions so there is no separate toolbar.
+        menu = QMenu(self)
         menu.addAction(show_action)
         menu.addSeparator()
+        menu.addAction(self.open_file_action)
+        menu.addAction(self.open_folder_action)
+        tray_drives = menu.addMenu("Диски")
+        tray_drives.aboutToShow.connect(lambda: self._populate_drives_menu(tray_drives))
+        menu.addSeparator()
+        menu.addAction(self.theme_action)
+        menu.addAction(self.update_action)
+        menu.addSeparator()
         menu.addAction(quit_action)
+
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
@@ -749,6 +757,7 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self.editor.set_dark(new_theme == "dark")
         self._sync_theme_action()
+        self._apply_app_style()
 
         if self.stack.currentIndex() == 1:
             self._render_preview(self.editor.text())
@@ -759,6 +768,49 @@ class MainWindow(QMainWindow):
 
     def _sync_theme_action(self) -> None:
         self.theme_action.setText("Светлая тема" if self.renderer.theme == "dark" else "Тёмная тема")
+
+    def _apply_app_style(self) -> None:
+        """A light, theme-aware Qt stylesheet for the window chrome (sidebar,
+        splitter, status bar, scrollbars). The rendered Markdown keeps its own
+        CSS; this only dresses up the surrounding native widgets."""
+        if self.renderer.theme == "dark":
+            c = {
+                "bg": "#171a21", "panel": "#1b1f27", "text": "#e5e7eb",
+                "muted": "#a6adbb", "border": "#2a3039", "accent": "#3b6fe0",
+                "sel": "#24406e", "hover": "#222732",
+            }
+        else:
+            c = {
+                "bg": "#ffffff", "panel": "#f7f9fc", "text": "#1f2937",
+                "muted": "#5d6675", "border": "#e1e6ee", "accent": "#2563eb",
+                "sel": "#dbe6ff", "hover": "#eef2f8",
+            }
+        self.setStyleSheet(
+            f"""
+            QMainWindow, QWidget {{ background: {c['bg']}; color: {c['text']}; }}
+            QTreeView {{
+                background: {c['panel']}; border: none; padding: 6px 4px;
+                outline: 0; font-size: 13px;
+            }}
+            QTreeView::item {{ padding: 4px 6px; border-radius: 6px; }}
+            QTreeView::item:hover {{ background: {c['hover']}; }}
+            QTreeView::item:selected {{ background: {c['sel']}; color: {c['text']}; }}
+            QSplitter::handle {{ background: {c['border']}; }}
+            QSplitter::handle:horizontal {{ width: 1px; }}
+            QStatusBar {{ background: {c['panel']}; color: {c['muted']}; border-top: 1px solid {c['border']}; }}
+            QStatusBar::item {{ border: none; }}
+            QProgressBar {{
+                border: 1px solid {c['border']}; border-radius: 6px;
+                background: {c['bg']}; text-align: center; height: 16px;
+            }}
+            QProgressBar::chunk {{ background: {c['accent']}; border-radius: 5px; }}
+            QScrollBar:vertical {{ background: transparent; width: 11px; margin: 0; }}
+            QScrollBar::handle:vertical {{ background: {c['border']}; border-radius: 5px; min-height: 28px; }}
+            QScrollBar::handle:vertical:hover {{ background: {c['muted']}; }}
+            QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+            QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+            """
+        )
 
     # ------------------------------------------------------------- search
 

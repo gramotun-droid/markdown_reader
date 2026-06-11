@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mdreader"
-version = "1.0.0"
+version = "1.1.0"
 description = "Просмотрщик и редактор Markdown-файлов и локальных wiki."
 requires-python = ">=3.11"
 dependencies = [
