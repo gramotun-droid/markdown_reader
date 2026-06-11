@@ -24,6 +24,9 @@ AppSupportURL={#MyAppURL}
 DefaultDirName={autopf}\MdReader
 DefaultGroupName=MD Reader
 DisableProgramGroupPage=yes
+; Resolve all relative paths (icon, dist\MdReader, OutputDir) from the repo
+; root, since this script lives in installer\.
+SourceDir=..
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=installer_output
