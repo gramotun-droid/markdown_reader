@@ -58,14 +58,26 @@ jobs:
       - name: Build exe
         run: pyinstaller mdreader.spec
 
-      - name: Package bundle
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if ($ver -match '^v(.+)$') { $ver = $Matches[1] } else { $ver = '0.0.0-dev' }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /DMyAppVersion=$ver installer\mdreader.iss
+
+      - name: Package portable bundle
         run: Compress-Archive -Path dist/MdReader/* -DestinationPath MdReader-windows.zip
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: MdReader-windows
-          path: MdReader-windows.zip
+          path: |
+            MdReader-windows.zip
+            installer_output/MdReader-Setup.exe
           if-no-files-found: error
 
       - name: Publish release (tags only)
@@ -75,5 +87,6 @@ jobs:
         run: >
           gh release create "${{ github.ref_name }}"
           MdReader-windows.zip
+          installer_output/MdReader-Setup.exe
           --title "MD Reader ${{ github.ref_name }}"
-          --notes "Windows build of MD Reader ${{ github.ref_name }}. Download MdReader-windows.zip, unzip and run MdReader.exe."
+          --notes "Windows build of MD Reader ${{ github.ref_name }}. Either run the MdReader-Setup.exe installer, or unzip MdReader-windows.zip and run MdReader.exe."

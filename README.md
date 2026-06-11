@@ -8,12 +8,15 @@ MD Reader - простой Windows-просмотрщик Markdown-файлов 
 
 ## Скачать (Windows)
 
-Готовую сборку под Windows собирает GitHub Actions:
+Готовую сборку под Windows собирает GitHub Actions. На выходе два варианта:
+
+- **`MdReader-Setup.exe`** — лёгкий установщик (Inno Setup): ставит приложение, создаёт ярлык в меню «Пуск» и uninstaller. Рекомендуемый способ.
+- **`MdReader-windows.zip`** — портативная сборка: распакуйте и запустите `MdReader.exe` (рядом должна лежать папка `_internal` — это обычная PyInstaller-сборка «одной папкой»).
+
+Где скачать:
 
 - **Последняя сборка из `main`:** вкладка [Actions](https://github.com/gramotun-droid/markdown_reader/actions/workflows/ci.yml) → последний успешный запуск → раздел **Artifacts** → `MdReader-windows`.
-- **Релизы по версиям:** запушьте тег `vX.Y.Z` (`git tag v1.0.0 && git push origin v1.0.0`) — workflow соберёт exe и приложит `MdReader-windows.zip` к [Releases](https://github.com/gramotun-droid/markdown_reader/releases).
-
-Распакуйте архив и запустите `MdReader.exe` (рядом должна лежать папка `_internal` из архива — это обычная PyInstaller-сборка «одной папкой»).
+- **Релизы по версиям:** запушьте тег `vX.Y.Z` (`git tag v1.0.0 && git push origin v1.0.0`) — workflow соберёт установщик и портативный архив и приложит их к [Releases](https://github.com/gramotun-droid/markdown_reader/releases).
 
 ## Возможности
 
