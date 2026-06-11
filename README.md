@@ -1,8 +1,19 @@
 # MD Reader
 
+[![CI](https://github.com/gramotun-droid/markdown_reader/actions/workflows/ci.yml/badge.svg)](https://github.com/gramotun-droid/markdown_reader/actions/workflows/ci.yml)
+
 MD Reader - простой Windows-просмотрщик Markdown-файлов и локальных файловых wiki.
 
 Приложение не является редактором. Основной сценарий: открыть `.md` или папку с Markdown-документами, читать отрендеренный HTML, переходить по относительным ссылкам и искать по текущей странице.
+
+## Скачать (Windows)
+
+Готовую сборку под Windows собирает GitHub Actions:
+
+- **Последняя сборка из `main`:** вкладка [Actions](https://github.com/gramotun-droid/markdown_reader/actions/workflows/ci.yml) → последний успешный запуск → раздел **Artifacts** → `MdReader-windows`.
+- **Релизы по версиям:** запушьте тег `vX.Y.Z` (`git tag v1.0.0 && git push origin v1.0.0`) — workflow соберёт exe и приложит `MdReader-windows.zip` к [Releases](https://github.com/gramotun-droid/markdown_reader/releases).
+
+Распакуйте архив и запустите `MdReader.exe` (рядом должна лежать папка `_internal` из архива — это обычная PyInstaller-сборка «одной папкой»).
 
 ## Возможности
 

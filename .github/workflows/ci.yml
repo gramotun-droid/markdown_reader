@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -32,3 +34,46 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  build-windows:
+    # Build a ready-to-run Windows bundle. Skipped on PRs to save CI minutes;
+    # runs on pushes to main, on version tags, and on manual dispatch.
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build exe
+        run: pyinstaller mdreader.spec
+
+      - name: Package bundle
+        run: Compress-Archive -Path dist/MdReader/* -DestinationPath MdReader-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MdReader-windows
+          path: MdReader-windows.zip
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          MdReader-windows.zip
+          --title "MD Reader ${{ github.ref_name }}"
+          --notes "Windows build of MD Reader ${{ github.ref_name }}. Download MdReader-windows.zip, unzip and run MdReader.exe."
