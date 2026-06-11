@@ -1,0 +1,6 @@
+PySide6>=6.7,<7
+markdown-it-py[linkify]>=3.0,<4
+mdit-py-plugins>=0.4,<1
+Pygments>=2.17,<3
+PyInstaller>=6.5,<7
+pytest>=8.0,<9

@@ -1,0 +1,759 @@
+from __future__ import annotations
+
+import os
+from functools import partial
+from pathlib import Path
+
+from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QFileSystemModel,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QToolBar,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .editor import MarkdownEditor
+from .folder_search import search_markdown_files
+from .icon import app_icon
+from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
+from .settings import APP_NAME, SUPPORTED_EXTENSIONS, TECHNICAL_DIRS, AppSettings
+from .web_page import MarkdownWebPage
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = AppSettings.load()
+        self.renderer = MarkdownRenderer(theme=self.settings.theme)
+        self.current_file: Path | None = None
+        self.current_folder: Path | None = None
+
+        self._history: list[Path] = []
+        self._history_index = -1
+        self._pending_scroll: dict[int, int] = {}
+        self._suppress_watch = False
+
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(app_icon())
+        self.resize(1220, 820)
+
+        self.file_model = QFileSystemModel(self)
+        self.file_model.setNameFilters(["*.md", "*.markdown"])
+        self.file_model.setNameFilterDisables(False)
+        self.file_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot)
+
+        self.tree = QTreeView(self)
+        self.tree.setModel(self.file_model)
+        self.tree.setHeaderHidden(True)
+        self.tree.clicked.connect(self._on_tree_clicked)
+        for column in range(1, self.file_model.columnCount()):
+            self.tree.hideColumn(column)
+
+        self.web_page = MarkdownWebPage(self)
+        self.web_page.open_markdown_callback = self.open_file
+        self.web_page.missing_file_callback = self._show_missing_link
+
+        self.viewer = QWebEngineView(self)
+        self.viewer.setPage(self.web_page)
+        self.viewer.setZoomFactor(self.settings.zoom_factor)
+        self.viewer.loadFinished.connect(partial(self._restore_scroll, self.viewer))
+
+        self.search_panel = self._create_search_panel()
+        self.search_panel.hide()
+
+        view_page = QWidget(self)
+        view_layout = QVBoxLayout(view_page)
+        view_layout.setContentsMargins(0, 0, 0, 0)
+        view_layout.setSpacing(0)
+        view_layout.addWidget(self.search_panel)
+        view_layout.addWidget(self.viewer)
+
+        self.preview = QWebEngineView(self)
+        self.preview.setPage(MarkdownWebPage(self))
+        self.preview.loadFinished.connect(partial(self._restore_scroll, self.preview))
+
+        self.editor = MarkdownEditor(self, dark=self.settings.theme == "dark")
+        self.editor.save_requested.connect(self._save_edits)
+        self.editor.cancel_requested.connect(self._cancel_edits)
+        self.editor.content_changed.connect(self._update_preview)
+
+        edit_page = QWidget(self)
+        edit_layout = QVBoxLayout(edit_page)
+        edit_layout.setContentsMargins(0, 0, 0, 0)
+        edit_layout.setSpacing(0)
+        edit_split = QSplitter(Qt.Orientation.Horizontal, edit_page)
+        edit_split.addWidget(self.editor)
+        edit_split.addWidget(self.preview)
+        edit_split.setSizes([600, 600])
+        edit_layout.addWidget(edit_split)
+
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(view_page)
+        self.stack.addWidget(edit_page)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.addWidget(self.tree)
+        self.splitter.addWidget(self.stack)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([300, 900])
+        self.setCentralWidget(self.splitter)
+
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.fileChanged.connect(self._on_file_changed)
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setSingleShot(True)
+        self._watch_timer.setInterval(150)
+        self._watch_timer.timeout.connect(self._do_watch_reload)
+
+        self._create_actions()
+        self._create_menus()
+        self._create_toolbar()
+        self._create_tray()
+        self._rebuild_recent_menu()
+        self._update_history_actions()
+        self._show_welcome()
+
+    # ------------------------------------------------------------------ open
+
+    def open_start_path(self, raw_path: str) -> None:
+        path = Path(raw_path).expanduser().resolve()
+        if path.is_file():
+            self.open_file(path)
+        elif path.is_dir():
+            self.open_folder(path)
+        else:
+            self._error("Путь не найден", f"Не удалось найти: {path}")
+
+    def open_file(self, path: Path, record_history: bool = True) -> None:
+        path = path.resolve()
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            self._error("Неподдерживаемый файл", "Можно открывать только .md и .markdown файлы.")
+            return
+
+        try:
+            rendered = self.renderer.render_file(path)
+        except OSError as exc:
+            self._error("Не удалось открыть файл", f"{path}\n\n{exc}")
+            return
+        except MarkdownRenderError as exc:
+            self._error("Ошибка Markdown", str(exc))
+            return
+
+        self.current_file = path
+        self.settings.last_path = path
+        self.settings.remember_recent(path)
+        self.web_page.current_markdown_path = path
+        self._display(self.viewer, rendered.html, path.parent)
+        self.setWindowTitle(f"{APP_NAME} - {path.name}")
+        self._select_file_in_tree(path)
+        self._watch(path)
+        self._rebuild_recent_menu()
+        if record_history:
+            self._record_history(path)
+        self.edit_action.setEnabled(True)
+        self.settings.save()
+
+    def open_folder(self, path: Path) -> None:
+        path = path.resolve()
+        if not path.exists() or not path.is_dir():
+            self._error("Папка не найдена", f"Не удалось открыть папку: {path}")
+            return
+
+        self.current_folder = path
+        self.settings.last_path = path
+        root_index = self.file_model.setRootPath(str(path))
+        self.tree.setRootIndex(root_index)
+        self.tree.expand(root_index)
+        self.folder_search_action.setEnabled(True)
+        self.settings.save()
+
+        start_file = self._find_start_file(path)
+        if start_file:
+            self.open_file(start_file)
+        else:
+            self._show_folder_empty(path)
+
+    # --------------------------------------------------------------- actions
+
+    def _create_actions(self) -> None:
+        self.open_file_action = QAction("Открыть файл", self)
+        self.open_file_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.open_file_action.triggered.connect(self._choose_file)
+
+        self.open_folder_action = QAction("Открыть папку", self)
+        self.open_folder_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self.open_folder_action.triggered.connect(self._choose_folder)
+
+        self.edit_action = QAction("Редактировать", self)
+        self.edit_action.setShortcut(QKeySequence("Ctrl+E"))
+        self.edit_action.setEnabled(False)
+        self.edit_action.triggered.connect(self.enter_edit_mode)
+
+        self.exit_action = QAction("Выход", self)
+        self.exit_action.triggered.connect(self.close)
+
+        self.find_action = QAction("Поиск на странице", self)
+        self.find_action.setShortcut(QKeySequence.StandardKey.Find)
+        self.find_action.triggered.connect(self._show_search)
+
+        self.folder_search_action = QAction("Поиск по папке", self)
+        self.folder_search_action.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.folder_search_action.setEnabled(False)
+        self.folder_search_action.triggered.connect(self._show_folder_search)
+
+        self.refresh_action = QAction("Обновить", self)
+        self.refresh_action.setShortcut(QKeySequence("Ctrl+R"))
+        self.refresh_action.triggered.connect(self.refresh_current)
+
+        self.back_action = QAction("Назад", self)
+        self.back_action.setShortcut(QKeySequence("Alt+Left"))
+        self.back_action.triggered.connect(self.navigate_back)
+
+        self.forward_action = QAction("Вперёд", self)
+        self.forward_action.setShortcut(QKeySequence("Alt+Right"))
+        self.forward_action.triggered.connect(self.navigate_forward)
+
+        self.theme_action = QAction("Тёмная тема", self)
+        self.theme_action.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        self.theme_action.triggered.connect(self.toggle_theme)
+        self._sync_theme_action()
+
+        self.zoom_in_action = QAction("Увеличить масштаб", self)
+        self.zoom_in_action.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        self.zoom_in_action.triggered.connect(self.zoom_in)
+
+        self.zoom_out_action = QAction("Уменьшить масштаб", self)
+        self.zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        self.zoom_out_action.triggered.connect(self.zoom_out)
+
+        self.zoom_reset_action = QAction("Сбросить масштаб", self)
+        self.zoom_reset_action.setShortcut(QKeySequence("Ctrl+0"))
+        self.zoom_reset_action.triggered.connect(self.zoom_reset)
+
+        self.about_action = QAction("О программе", self)
+        self.about_action.triggered.connect(self._show_about)
+
+    def _create_menus(self) -> None:
+        file_menu = self.menuBar().addMenu("Файл")
+        file_menu.addAction(self.open_file_action)
+        file_menu.addAction(self.open_folder_action)
+        self.recent_menu = file_menu.addMenu("Недавние файлы")
+        file_menu.addSeparator()
+        file_menu.addAction(self.edit_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.exit_action)
+
+        view_menu = self.menuBar().addMenu("Вид")
+        view_menu.addAction(self.back_action)
+        view_menu.addAction(self.forward_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.theme_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.zoom_in_action)
+        view_menu.addAction(self.zoom_out_action)
+        view_menu.addAction(self.zoom_reset_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.refresh_action)
+
+        search_menu = self.menuBar().addMenu("Поиск")
+        search_menu.addAction(self.find_action)
+        search_menu.addAction(self.folder_search_action)
+
+        help_menu = self.menuBar().addMenu("Справка")
+        help_menu.addAction(self.about_action)
+
+    def _create_toolbar(self) -> None:
+        toolbar = QToolBar("Основные действия", self)
+        toolbar.setMovable(False)
+        toolbar.addAction(self.open_file_action)
+        toolbar.addAction(self.open_folder_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.back_action)
+        toolbar.addAction(self.forward_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.edit_action)
+        toolbar.addAction(self.find_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.theme_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.zoom_out_action)
+        toolbar.addAction(self.zoom_reset_action)
+        toolbar.addAction(self.zoom_in_action)
+        self.addToolBar(toolbar)
+
+    def _create_tray(self) -> None:
+        self.tray: QSystemTrayIcon | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(app_icon(), self)
+        self.tray.setToolTip(APP_NAME)
+        menu = QMenu(self)
+        show_action = QAction("Показать окно", self)
+        show_action.triggered.connect(self._restore_window)
+        quit_action = QAction("Выход", self)
+        quit_action.triggered.connect(self.close)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._restore_window()
+
+    def _restore_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _create_search_panel(self) -> QWidget:
+        panel = QWidget(self)
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+
+        label = QLabel("Поиск:", panel)
+        self.search_input = QLineEdit(panel)
+        self.search_input.setPlaceholderText("Введите текст")
+        self.search_input.textChanged.connect(self._find_text)
+        self.search_input.returnPressed.connect(self._find_next)
+
+        previous_button = QPushButton("Назад", panel)
+        previous_button.clicked.connect(self._find_previous)
+
+        next_button = QPushButton("Далее", panel)
+        next_button.clicked.connect(self._find_next)
+
+        close_button = QPushButton("Закрыть", panel)
+        close_button.clicked.connect(self._hide_search)
+
+        layout.addWidget(label)
+        layout.addWidget(self.search_input, 1)
+        layout.addWidget(previous_button)
+        layout.addWidget(next_button)
+        layout.addWidget(close_button)
+        return panel
+
+    # ----------------------------------------------------------- edit mode
+
+    def enter_edit_mode(self) -> None:
+        if not self.current_file:
+            return
+        try:
+            text = read_text_with_fallback(self.current_file)
+        except (OSError, UnicodeDecodeError) as exc:
+            self._error("Не удалось открыть файл для правки", str(exc))
+            return
+
+        self.editor.load(text, label=str(self.current_file))
+        self._render_preview(text)
+        self.stack.setCurrentIndex(1)
+        self.edit_action.setEnabled(False)
+        self.editor.focus_editor()
+
+    def _update_preview(self) -> None:
+        # Capture the preview scroll position before re-rendering so typing
+        # does not jump the preview back to the top.
+        self.preview.page().runJavaScript("window.scrollY", 0, self._render_preview_at)
+
+    def _render_preview_at(self, scroll_y) -> None:
+        self._render_preview(self.editor.text(), scroll_to=int(scroll_y or 0))
+
+    def _render_preview(self, text: str, scroll_to: int = 0) -> None:
+        try:
+            html = self.renderer.render_text(text, title="preview").html
+        except MarkdownRenderError:
+            return
+        base = self.current_file.parent if self.current_file else Path.cwd()
+        self._display(self.preview, html, base, scroll_to=scroll_to)
+
+    def _save_edits(self) -> None:
+        if not self.current_file:
+            return
+        text = self.editor.text()
+        try:
+            self._suppress_watch = True
+            self.current_file.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            self._error("Не удалось сохранить файл", f"{self.current_file}\n\n{exc}")
+            self._suppress_watch = False
+            return
+        self.editor.mark_saved()
+        QTimer.singleShot(300, self._release_watch)
+        self._exit_edit_mode()
+        self.open_file(self.current_file, record_history=False)
+
+    def _cancel_edits(self) -> None:
+        if self.editor.is_modified():
+            answer = QMessageBox.question(
+                self,
+                "Отменить правки",
+                "Несохранённые изменения будут потеряны. Закрыть редактор?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._exit_edit_mode()
+
+    def _exit_edit_mode(self) -> None:
+        self.stack.setCurrentIndex(0)
+        self.edit_action.setEnabled(self.current_file is not None)
+        self.viewer.setFocus()
+
+    def _release_watch(self) -> None:
+        self._suppress_watch = False
+
+    # ------------------------------------------------------------- watcher
+
+    def _watch(self, path: Path) -> None:
+        existing = self.watcher.files()
+        if existing:
+            self.watcher.removePaths(existing)
+        self.watcher.addPath(str(path))
+
+    def _on_file_changed(self, _path: str) -> None:
+        if self._suppress_watch or self.stack.currentIndex() == 1:
+            return
+        self._watch_timer.start()
+
+    def _do_watch_reload(self) -> None:
+        if not self.current_file:
+            return
+        if not self.current_file.exists():
+            return
+        if str(self.current_file) not in self.watcher.files():
+            self.watcher.addPath(str(self.current_file))
+        self.refresh_current()
+
+    # ---------------------------------------------------------- navigation
+
+    def _record_history(self, path: Path) -> None:
+        if self._history and self._history[self._history_index] == path:
+            return
+        del self._history[self._history_index + 1:]
+        self._history.append(path)
+        self._history_index = len(self._history) - 1
+        self._update_history_actions()
+
+    def navigate_back(self) -> None:
+        if self._history_index <= 0:
+            return
+        self._history_index -= 1
+        self.open_file(self._history[self._history_index], record_history=False)
+        self._update_history_actions()
+
+    def navigate_forward(self) -> None:
+        if self._history_index >= len(self._history) - 1:
+            return
+        self._history_index += 1
+        self.open_file(self._history[self._history_index], record_history=False)
+        self._update_history_actions()
+
+    def _update_history_actions(self) -> None:
+        self.back_action.setEnabled(self._history_index > 0)
+        self.forward_action.setEnabled(self._history_index < len(self._history) - 1)
+
+    # ------------------------------------------------------------- recent
+
+    def _rebuild_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        if not self.settings.recent_files:
+            empty = self.recent_menu.addAction("Пусто")
+            empty.setEnabled(False)
+            return
+        for path in self.settings.recent_files:
+            action = self.recent_menu.addAction(path.name)
+            action.setToolTip(str(path))
+            action.triggered.connect(partial(self._open_recent, path))
+        self.recent_menu.addSeparator()
+        clear_action = self.recent_menu.addAction("Очистить список")
+        clear_action.triggered.connect(self._clear_recent)
+
+    def _open_recent(self, path: Path) -> None:
+        if path.exists():
+            self.open_file(path)
+        else:
+            self._error("Файл не найден", f"Файл больше не существует:\n{path}")
+            self.settings.recent_files = [item for item in self.settings.recent_files if item != path]
+            self.settings.save()
+            self._rebuild_recent_menu()
+
+    def _clear_recent(self) -> None:
+        self.settings.recent_files = []
+        self.settings.save()
+        self._rebuild_recent_menu()
+
+    # --------------------------------------------------------- folder search
+
+    def _show_folder_search(self) -> None:
+        if not self.current_folder:
+            return
+        dialog = FolderSearchDialog(self.current_folder, self)
+        dialog.file_chosen.connect(self.open_file)
+        dialog.exec()
+
+    # ----------------------------------------------------------- file/folder
+
+    def _choose_file(self) -> None:
+        last = self.settings.last_path
+        if last and last.is_file():
+            start_dir = str(last.parent)
+        else:
+            start_dir = str(last or Path.home())
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть Markdown файл",
+            start_dir,
+            "Markdown files (*.md *.markdown)",
+        )
+        if file_name:
+            self.open_file(Path(file_name))
+
+    def _choose_folder(self) -> None:
+        start_dir = str(self.settings.last_path if self.settings.last_path and self.settings.last_path.is_dir() else Path.home())
+        folder_name = QFileDialog.getExistingDirectory(self, "Открыть папку wiki", start_dir)
+        if folder_name:
+            self.open_folder(Path(folder_name))
+
+    def _on_tree_clicked(self, index: QModelIndex) -> None:
+        path = Path(self.file_model.filePath(index))
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            self.open_file(path)
+
+    def _select_file_in_tree(self, path: Path) -> None:
+        if not self.current_folder:
+            return
+        try:
+            if not path.is_relative_to(self.current_folder):
+                return
+        except AttributeError:
+            if self.current_folder not in path.parents and path != self.current_folder:
+                return
+
+        index = self.file_model.index(str(path))
+        if index.isValid():
+            self.tree.setCurrentIndex(index)
+            self.tree.scrollTo(index)
+
+    def _find_start_file(self, folder: Path) -> Path | None:
+        for name in ("index.md", "README.md", "readme.md", "Index.md"):
+            candidate = folder / name
+            if candidate.exists():
+                return candidate
+
+        root_markdown_files = sorted(
+            candidate for candidate in folder.iterdir() if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+        if root_markdown_files:
+            return root_markdown_files[0]
+
+        for dirpath, dirnames, filenames in os.walk(folder, onerror=lambda _error: None):
+            dirnames[:] = [name for name in dirnames if name not in TECHNICAL_DIRS]
+            for filename in sorted(filenames):
+                candidate = Path(dirpath) / filename
+                if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    return candidate
+        return None
+
+    # ----------------------------------------------------------- view/zoom
+
+    def refresh_current(self) -> None:
+        if self.current_file:
+            self.viewer.page().runJavaScript("window.scrollY", 0, self._refresh_at)
+
+    def _refresh_at(self, scroll_y) -> None:
+        if not self.current_file:
+            return
+        try:
+            rendered = self.renderer.render_file(self.current_file)
+        except (OSError, MarkdownRenderError) as exc:
+            self._error("Не удалось обновить", str(exc))
+            return
+        self._display(self.viewer, rendered.html, self.current_file.parent, scroll_to=int(scroll_y or 0))
+
+    def zoom_in(self) -> None:
+        self._set_zoom(min(self.viewer.zoomFactor() + 0.1, 3.0))
+
+    def zoom_out(self) -> None:
+        self._set_zoom(max(self.viewer.zoomFactor() - 0.1, 0.25))
+
+    def zoom_reset(self) -> None:
+        self._set_zoom(1.0)
+
+    def _set_zoom(self, factor: float) -> None:
+        self.viewer.setZoomFactor(factor)
+        self.preview.setZoomFactor(factor)
+        self.settings.zoom_factor = factor
+        self.settings.save()
+
+    # -------------------------------------------------------------- theme
+
+    def toggle_theme(self) -> None:
+        new_theme = "dark" if self.renderer.theme == "light" else "light"
+        self.renderer.set_theme(new_theme)
+        self.settings.theme = new_theme
+        self.settings.save()
+        self.editor.set_dark(new_theme == "dark")
+        self._sync_theme_action()
+
+        if self.stack.currentIndex() == 1:
+            self._render_preview(self.editor.text())
+        if self.current_file:
+            self.open_file(self.current_file, record_history=False)
+        else:
+            self._show_welcome()
+
+    def _sync_theme_action(self) -> None:
+        self.theme_action.setText("Светлая тема" if self.renderer.theme == "dark" else "Тёмная тема")
+
+    # ------------------------------------------------------------- search
+
+    def _show_search(self) -> None:
+        self.search_panel.show()
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def _hide_search(self) -> None:
+        self.viewer.findText("")
+        self.search_panel.hide()
+        self.viewer.setFocus()
+
+    def _find_text(self, text: str) -> None:
+        self.viewer.findText(text)
+
+    def _find_next(self) -> None:
+        self.viewer.findText(self.search_input.text())
+
+    def _find_previous(self) -> None:
+        self.viewer.findText(self.search_input.text(), QWebEnginePage.FindFlag.FindBackward)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.search_panel.isVisible():
+            self._hide_search()
+            return
+        super().keyPressEvent(event)
+
+    # ----------------------------------------------------------- rendering
+
+    def _display(self, view: QWebEngineView, html: str, base_dir: Path, scroll_to: int = 0) -> None:
+        self._pending_scroll[id(view)] = scroll_to
+        view.setHtml(html, QUrl.fromLocalFile(str(base_dir) + "/"))
+
+    def _restore_scroll(self, view: QWebEngineView, ok: bool) -> None:
+        scroll_to = self._pending_scroll.pop(id(view), 0)
+        if ok and scroll_to:
+            view.page().runJavaScript(f"window.scrollTo(0, {scroll_to});")
+
+    # ------------------------------------------------------------- screens
+
+    def _show_missing_link(self, path: Path) -> None:
+        self._error("Файл не найден", f"Ссылка ведёт на несуществующий файл:\n{path}")
+
+    def _show_welcome(self) -> None:
+        html = self.renderer.render_text(
+            "# MD Reader\n\nОткройте Markdown-файл или папку wiki через меню **Файл**.",
+            title="MD Reader",
+        ).html
+        self._display(self.viewer, html, Path.cwd())
+
+    def _show_folder_empty(self, path: Path) -> None:
+        html = self.renderer.render_text(
+            f"# Папка открыта\n\nВ папке не найдено Markdown-файлов:\n\n`{path}`",
+            title="Папка открыта",
+        ).html
+        self.current_file = None
+        self.web_page.current_markdown_path = None
+        self.edit_action.setEnabled(False)
+        self._display(self.viewer, html, path)
+        self.setWindowTitle(f"{APP_NAME} - {path.name}")
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "О программе",
+            "MD Reader\n\nПростой просмотрщик и редактор Markdown-файлов и локальных wiki.",
+        )
+
+    def _error(self, title: str, text: str) -> None:
+        QMessageBox.warning(self, title, text)
+
+
+class FolderSearchDialog(QDialog):
+    """Full-text search across the open wiki folder."""
+
+    file_chosen = Signal(object)
+
+    def __init__(self, folder: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.folder = folder
+        self.setWindowTitle("Поиск по папке")
+        self.resize(720, 480)
+
+        self.input = QLineEdit(self)
+        self.input.setPlaceholderText("Введите текст и нажмите Enter")
+        self.input.returnPressed.connect(self._run_search)
+
+        search_button = QPushButton("Найти", self)
+        search_button.clicked.connect(self._run_search)
+
+        self.status = QLabel("", self)
+        self.results = QListWidget(self)
+        self.results.itemActivated.connect(self._on_activated)
+        self.results.itemDoubleClicked.connect(self._on_activated)
+
+        top = QHBoxLayout()
+        top.addWidget(self.input, 1)
+        top.addWidget(search_button)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self.status)
+        layout.addWidget(self.results, 1)
+
+    def _run_search(self) -> None:
+        query = self.input.text().strip()
+        self.results.clear()
+        if not query:
+            self.status.setText("")
+            return
+        hits = search_markdown_files(self.folder, query)
+        self.status.setText(f"Найдено совпадений: {len(hits)}")
+        for hit in hits:
+            rel = _safe_relative(hit.path, self.folder)
+            item = QListWidgetItem(f"{rel}:{hit.line_number}  —  {hit.snippet}")
+            item.setData(Qt.ItemDataRole.UserRole, str(hit.path))
+            self.results.addItem(item)
+
+    def _on_activated(self, item: QListWidgetItem) -> None:
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path:
+            self.file_chosen.emit(Path(path))
+            self.accept()
+
+
+def _safe_relative(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
