@@ -242,13 +242,30 @@ class MainWindow(QMainWindow):
             # Defer so the window paints first; the check runs off the GUI thread.
             QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
 
+    def _show_update_activity(self, text: str) -> None:
+        """Show an indeterminate ('busy') progress bar in the status bar so the
+        user can see that a check/download is actually running."""
+        self._update_progress.setRange(0, 0)  # marquee / busy animation
+        self._update_progress.setFormat(text)
+        self._update_progress.setTextVisible(True)
+        self._update_progress.show()
+        self.statusBar().showMessage(text)
+
+    def _finish_update_activity(self) -> None:
+        self._update_progress.setRange(0, 100)
+        self._update_progress.reset()
+        self._update_progress.hide()
+        self.statusBar().clearMessage()
+
     def check_for_updates(self, silent: bool = False) -> None:
         if self._update_in_progress:
             return
         self._update_in_progress = True
         self._update_silent = silent
         if not silent:
-            self.statusBar().showMessage("Проверка обновлений…", 4000)
+            # Always-visible "checking" indicator (the request can take up to
+            # ~10s), so the user is never left wondering whether it worked.
+            self._show_update_activity("Проверка обновлений…")
         threading.Thread(target=self._run_update_check, daemon=True).start()
 
     def _run_update_check(self) -> None:
@@ -262,6 +279,7 @@ class MainWindow(QMainWindow):
     def _on_update_checked(self, info: object) -> None:
         if info is None:
             self._update_in_progress = False
+            self._finish_update_activity()
             if not self._update_silent:
                 QMessageBox.information(
                     self,
@@ -277,19 +295,24 @@ class MainWindow(QMainWindow):
         else:
             # From source or no installer asset: just point at the release page.
             self._update_in_progress = False
+            self._finish_update_activity()
             self.statusBar().showMessage(f"Доступна версия {info.tag}", 8000)  # type: ignore[attr-defined]
             if not self._update_silent:
                 QDesktopServices.openUrl(QUrl(info.html_url))  # type: ignore[attr-defined]
 
     def _on_update_check_failed(self, message: str) -> None:
         self._update_in_progress = False
+        self._finish_update_activity()
         if not self._update_silent:
             self._error("Не удалось проверить обновления", message)
 
     def _start_update_download(self, info: UpdateInfo) -> None:
         dest = str(Path(tempfile.gettempdir()) / (info.asset_name or INSTALLER_ASSET))
+        # Switch from the busy "checking" bar to a determinate download bar.
+        self._update_progress.setRange(0, 100)
         self._update_progress.setValue(0)
-        self._update_progress.setFormat(f"Обновление {info.tag} — %p%")
+        self._update_progress.setFormat(f"Загрузка обновления {info.tag} — %p%")
+        self._update_progress.setTextVisible(True)
         self._update_progress.show()
         self.statusBar().showMessage(f"Загрузка обновления MD Reader {info.tag}…")
         threading.Thread(
@@ -307,7 +330,7 @@ class MainWindow(QMainWindow):
             self._update_signals.download_done.emit(dest)
 
     def _on_update_downloaded(self, path: str) -> None:
-        self._update_progress.hide()
+        self._finish_update_activity()
         self.statusBar().showMessage("Установка обновления…")
         # Launch the installer silently and quit so it can replace running files.
         started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
@@ -318,7 +341,7 @@ class MainWindow(QMainWindow):
             self._error("Не удалось запустить установщик обновления", path)
 
     def _on_update_download_failed(self, message: str) -> None:
-        self._update_progress.hide()
+        self._finish_update_activity()
         self._update_in_progress = False
         if not self._update_silent:
             self._error("Не удалось загрузить обновление", message)
