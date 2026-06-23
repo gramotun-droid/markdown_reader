@@ -898,8 +898,10 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- view/zoom
 
     def refresh_current(self) -> None:
-        if self.current_file:
-            self.viewer.page().runJavaScript("window.scrollY", 0, self._refresh_at)
+        if not self.current_file:
+            self.statusBar().showMessage("Нет открытого файла для обновления", 3000)
+            return
+        self.viewer.page().runJavaScript("window.scrollY", 0, self._refresh_at)
 
     def _refresh_at(self, scroll_y) -> None:
         if not self.current_file:
@@ -910,6 +912,7 @@ class MainWindow(QMainWindow):
             self._error("Не удалось обновить", str(exc))
             return
         self._display(self.viewer, rendered.html, self.current_file.parent, scroll_to=int(scroll_y or 0))
+        self.statusBar().showMessage(f"Обновлено: {self.current_file.name}", 2000)
 
     def zoom_in(self) -> None:
         self._set_zoom(min(self.viewer.zoomFactor() + 0.1, 3.0))
