@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -88,10 +89,18 @@ def fetch_latest_release(timeout: float = 10.0) -> UpdateInfo:
 def check_for_update(current: str = __version__, timeout: float = 10.0) -> UpdateInfo | None:
     """Return release info if a newer version is published, else ``None``.
 
-    Raises on network/parse errors so the caller can decide whether to surface
-    the failure (manual check) or stay silent (startup check).
+    A repository with no published releases yet answers ``releases/latest`` with
+    HTTP 404; that simply means "nothing to update to", so it is treated as
+    up-to-date rather than an error. Other network/parse errors still raise so
+    the caller can decide whether to surface the failure (manual check) or stay
+    silent (startup check).
     """
-    info = fetch_latest_release(timeout=timeout)
+    try:
+        info = fetch_latest_release(timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
     if info.tag and is_newer(info.version, current):
         return info
     return None

@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 block_cipher = None
@@ -12,8 +12,14 @@ datas = [
     ("app/assets/logo.svg", "app/assets"),
     ("app/templates/page.html", "app/templates"),
 ]
+# python-docx ships a default .docx template that must be bundled alongside it.
+datas += collect_data_files("docx")
 
-hiddenimports = collect_submodules("markdown_it") + collect_submodules("mdit_py_plugins")
+hiddenimports = (
+    collect_submodules("markdown_it")
+    + collect_submodules("mdit_py_plugins")
+    + collect_submodules("docx")
+)
 
 a = Analysis(
     ["app/main.py"],
