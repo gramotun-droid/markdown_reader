@@ -143,6 +143,10 @@ class MainWindow(QMainWindow):
         self.file_model.setNameFilters(["*.md", "*.markdown"])
         self.file_model.setNameFilterDisables(False)
         self.file_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot)
+        # The model loads directories lazily, so revealing a deeply nested file
+        # has to wait for each level to populate; _reveal_target drives that.
+        self._reveal_target: Path | None = None
+        self.file_model.directoryLoaded.connect(self._on_directory_loaded)
 
         self.tree = QTreeView(self)
         self.tree.setModel(self.file_model)
@@ -867,36 +871,40 @@ class MainWindow(QMainWindow):
     def _ensure_tree_for_file(self, path: Path) -> None:
         """Make sure the sidebar shows the directory tree containing the open
         file and highlights it. For files opened on their own (not via a wiki
-        folder) the tree is rooted at the file's parent directory so the user
-        always sees where the document lives."""
-        if self.current_folder and _is_within(path, self.current_folder):
-            self._select_file_in_tree(path)
-            return
+        folder) the tree is rooted at the filesystem/drive root so the whole
+        chain of parent folders down to the file stays visible."""
+        self._reveal_target = path
+        if not (self.current_folder and _is_within(path, self.current_folder)):
+            # current_folder stays the file's own folder (search scope), but the
+            # tree is rooted higher so the parent folders are shown too.
+            self.current_folder = path.parent
+            root = Path(path.anchor) if path.anchor else path.parent
+            self.file_model.setRootPath(str(root))
+            self.tree.setRootIndex(self.file_model.index(str(root)))
+            self.folder_search_action.setEnabled(True)
+        self._try_reveal()
 
-        folder = path.parent
-        self.current_folder = folder
-        root_index = self.file_model.setRootPath(str(folder))
-        self.tree.setRootIndex(root_index)
-        self.tree.expand(root_index)
-        self.folder_search_action.setEnabled(True)
-        self._select_file_in_tree(path)
-        # The model loads directory entries asynchronously, so re-select once it
-        # has had a chance to populate the (possibly nested) path.
-        QTimer.singleShot(60, lambda: self._select_file_in_tree(path))
+    def _on_directory_loaded(self, _loaded_path: str) -> None:
+        # Each lazily-loaded level may finally expose the target file.
+        self._try_reveal()
 
-    def _select_file_in_tree(self, path: Path) -> None:
-        if not self.current_folder or not _is_within(path, self.current_folder):
-            return
+    def _try_reveal(self) -> None:
+        target = self._reveal_target
+        if target is not None and self._select_file_in_tree(target):
+            self._reveal_target = None  # revealed; stop hijacking later loads
 
+    def _select_file_in_tree(self, path: Path) -> bool:
         index = self.file_model.index(str(path))
-        if index.isValid():
-            self.tree.setCurrentIndex(index)
-            self.tree.scrollTo(index)
-            # Reveal the folder tree leading down to the file.
-            parent = index.parent()
-            while parent.isValid():
-                self.tree.expand(parent)
-                parent = parent.parent()
+        if not index.isValid():
+            return False
+        # Expand the whole chain of parent folders so the path is revealed.
+        parent = index.parent()
+        while parent.isValid():
+            self.tree.expand(parent)
+            parent = parent.parent()
+        self.tree.setCurrentIndex(index)
+        self.tree.scrollTo(index, QTreeView.ScrollHint.PositionAtCenter)
+        return True
 
     def _find_start_file(self, folder: Path) -> Path | None:
         for name in ("index.md", "README.md", "readme.md", "Index.md"):
