@@ -26,8 +26,10 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QSplitterHandle,
     QStackedWidget,
     QSystemTrayIcon,
+    QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .drives import available_roots
 from .editor import MarkdownEditor
+from .export import ExportError, markdown_to_docx
 from .folder_search import search_markdown_files
 from .icon import app_icon
 from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
@@ -52,6 +55,71 @@ class _UpdateSignals(QObject):
     progress = Signal(int)
     download_done = Signal(str)  # path to downloaded installer
     download_failed = Signal(str)
+
+
+class _SidebarSplitterHandle(QSplitterHandle):
+    """Splitter divider that carries a small button to collapse/expand the
+    sidebar, the way IDEs and other "grown-up" apps do it."""
+
+    def __init__(self, orientation: Qt.Orientation, splitter: SidebarSplitter) -> None:
+        super().__init__(orientation, splitter)
+        self.button = QToolButton(self)
+        self.button.setObjectName("sidebarToggle")
+        self.button.setAutoRaise(True)
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.button.setFixedSize(splitter.handleWidth(), 48)
+        self.button.clicked.connect(splitter.toggle_sidebar)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addSpacing(10)
+        layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        layout.addStretch(1)
+
+
+class SidebarSplitter(QSplitter):
+    """Horizontal splitter whose first pane (the tree) can be toggled via a
+    button living on the divider handle."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setHandleWidth(12)
+        self._restore_width = 300
+        self._toggle_button: QToolButton | None = None
+
+    def createHandle(self) -> QSplitterHandle:  # noqa: N802 - Qt override
+        # Qt calls this while the splitter is still being built, so avoid
+        # querying sizes() here (it re-enters C++ and can crash); the sidebar
+        # starts expanded, so seed the glyph directly.
+        handle = _SidebarSplitterHandle(self.orientation(), self)
+        self._toggle_button = handle.button
+        self._toggle_button.setText("‹")
+        self._toggle_button.setToolTip("Скрыть дерево")
+        return handle
+
+    def sidebar_collapsed(self) -> bool:
+        return self.sizes()[0] == 0
+
+    def toggle_sidebar(self) -> None:
+        sizes = self.sizes()
+        total = sum(sizes)
+        if sizes[0] > 0:
+            self._restore_width = sizes[0]
+            self.setSizes([0, total])
+        else:
+            width = self._restore_width or 300
+            width = min(width, max(160, total - 160))
+            self.setSizes([width, total - width])
+        self._sync_button()
+
+    def _sync_button(self) -> None:
+        if self._toggle_button is None:
+            return
+        collapsed = self.sidebar_collapsed()
+        # ‹ points "into" the sidebar to hide it, › points out to reveal it.
+        self._toggle_button.setText("›" if collapsed else "‹")
+        self._toggle_button.setToolTip("Показать дерево" if collapsed else "Скрыть дерево")
 
 
 class MainWindow(QMainWindow):
@@ -86,6 +154,7 @@ class MainWindow(QMainWindow):
         self.web_page = MarkdownWebPage(self)
         self.web_page.open_markdown_callback = self.open_file
         self.web_page.missing_file_callback = self._show_missing_link
+        self.web_page.pdfPrintingFinished.connect(self._on_pdf_finished)
 
         self.viewer = QWebEngineView(self)
         self.viewer.setPage(self.web_page)
@@ -107,8 +176,6 @@ class MainWindow(QMainWindow):
         self.preview.loadFinished.connect(partial(self._restore_scroll, self.preview))
 
         self.editor = MarkdownEditor(self, dark=self.settings.theme == "dark")
-        self.editor.save_requested.connect(self._save_edits)
-        self.editor.cancel_requested.connect(self._cancel_edits)
         self.editor.content_changed.connect(self._update_preview)
 
         edit_page = QWidget(self)
@@ -125,7 +192,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(view_page)
         self.stack.addWidget(edit_page)
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter = SidebarSplitter(self)
         self.splitter.addWidget(self.tree)
         self.splitter.addWidget(self.stack)
         self.splitter.setStretchFactor(0, 0)
@@ -290,12 +357,14 @@ class MainWindow(QMainWindow):
         self.web_page.current_markdown_path = path
         self._display(self.viewer, rendered.html, path.parent)
         self.setWindowTitle(f"{APP_NAME} - {path.name}")
-        self._select_file_in_tree(path)
+        self._ensure_tree_for_file(path)
         self._watch(path)
         self._rebuild_recent_menu()
         if record_history:
             self._record_history(path)
         self.edit_action.setEnabled(True)
+        self.export_pdf_action.setEnabled(True)
+        self.export_docx_action.setEnabled(True)
         self.settings.save()
 
     def open_folder(self, path: Path) -> None:
@@ -333,6 +402,40 @@ class MainWindow(QMainWindow):
         self.edit_action.setShortcut(QKeySequence("Ctrl+E"))
         self.edit_action.setEnabled(False)
         self.edit_action.triggered.connect(self.enter_edit_mode)
+
+        self.export_pdf_action = QAction("В PDF…", self)
+        self.export_pdf_action.setEnabled(False)
+        self.export_pdf_action.triggered.connect(self.export_pdf)
+
+        self.export_docx_action = QAction("В Word (DOCX)…", self)
+        self.export_docx_action.setEnabled(False)
+        self.export_docx_action.triggered.connect(self.export_docx)
+
+        self.save_action = QAction("Сохранить", self)
+        self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_action.setEnabled(False)
+        self.save_action.triggered.connect(self._save_edits)
+
+        self.cancel_edit_action = QAction("Отменить правки", self)
+        self.cancel_edit_action.setEnabled(False)
+        self.cancel_edit_action.triggered.connect(self._cancel_edits)
+
+        self.undo_action = QAction("Отменить", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.setEnabled(False)
+        self.undo_action.triggered.connect(self.editor.undo)
+
+        self.redo_action = QAction("Повторить", self)
+        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.setEnabled(False)
+        self.redo_action.triggered.connect(self.editor.redo)
+
+        self.editor.undo_available.connect(self.undo_action.setEnabled)
+        self.editor.redo_available.connect(self.redo_action.setEnabled)
+
+        self.toggle_sidebar_action = QAction("Боковая панель", self)
+        self.toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
+        self.toggle_sidebar_action.triggered.connect(self.splitter.toggle_sidebar)
 
         self.exit_action = QAction("Выход", self)
         self.exit_action.triggered.connect(self.close)
@@ -389,11 +492,24 @@ class MainWindow(QMainWindow):
         self.drives_menu.aboutToShow.connect(lambda: self._populate_drives_menu(self.drives_menu))
         self.recent_menu = file_menu.addMenu("Недавние файлы")
         file_menu.addSeparator()
-        file_menu.addAction(self.edit_action)
+        export_menu = file_menu.addMenu("Экспорт")
+        export_menu.addAction(self.export_pdf_action)
+        export_menu.addAction(self.export_docx_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
+        edit_menu = self.menuBar().addMenu("Правка")
+        edit_menu.addAction(self.edit_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.save_action)
+        edit_menu.addAction(self.cancel_edit_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.undo_action)
+        edit_menu.addAction(self.redo_action)
+
         view_menu = self.menuBar().addMenu("Вид")
+        view_menu.addAction(self.toggle_sidebar_action)
+        view_menu.addSeparator()
         view_menu.addAction(self.back_action)
         view_menu.addAction(self.forward_action)
         view_menu.addSeparator()
@@ -510,6 +626,8 @@ class MainWindow(QMainWindow):
         self._render_preview(text)
         self.stack.setCurrentIndex(1)
         self.edit_action.setEnabled(False)
+        self.save_action.setEnabled(True)
+        self.cancel_edit_action.setEnabled(True)
         self.editor.focus_editor()
 
     def _update_preview(self) -> None:
@@ -560,6 +678,8 @@ class MainWindow(QMainWindow):
     def _exit_edit_mode(self) -> None:
         self.stack.setCurrentIndex(0)
         self.edit_action.setEnabled(self.current_file is not None)
+        self.save_action.setEnabled(False)
+        self.cancel_edit_action.setEnabled(False)
         self.viewer.setFocus()
 
     def _release_watch(self) -> None:
@@ -654,6 +774,45 @@ class MainWindow(QMainWindow):
         dialog.file_chosen.connect(self.open_file)
         dialog.exec()
 
+    # --------------------------------------------------------------- export
+
+    def export_pdf(self) -> None:
+        if not self.current_file:
+            return
+        default = str(self.current_file.with_suffix(".pdf"))
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт в PDF", default, "PDF (*.pdf)")
+        if not path:
+            return
+        self.statusBar().showMessage("Экспорт в PDF…")
+        # printToPdf renders the page currently shown in the viewer, so the
+        # result matches what the user sees. Completion arrives via the
+        # pdfPrintingFinished signal connected in __init__.
+        self.viewer.page().printToPdf(path)
+
+    def _on_pdf_finished(self, path: str, ok: bool) -> None:
+        if ok:
+            self.statusBar().showMessage(f"Сохранено в PDF: {path}", 6000)
+        else:
+            self._error("Не удалось экспортировать PDF", path)
+
+    def export_docx(self) -> None:
+        if not self.current_file:
+            return
+        default = str(self.current_file.with_suffix(".docx"))
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт в Word", default, "Word (*.docx)")
+        if not path:
+            return
+        try:
+            text = read_text_with_fallback(self.current_file)
+            markdown_to_docx(text, Path(path), title=self.current_file.stem)
+        except (OSError, UnicodeDecodeError) as exc:
+            self._error("Не удалось экспортировать DOCX", f"{path}\n\n{exc}")
+            return
+        except ExportError as exc:
+            self._error("Не удалось экспортировать DOCX", str(exc))
+            return
+        self.statusBar().showMessage(f"Сохранено в DOCX: {path}", 6000)
+
     # ----------------------------------------------------------- file/folder
 
     def _choose_file(self) -> None:
@@ -682,20 +841,39 @@ class MainWindow(QMainWindow):
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
             self.open_file(path)
 
-    def _select_file_in_tree(self, path: Path) -> None:
-        if not self.current_folder:
+    def _ensure_tree_for_file(self, path: Path) -> None:
+        """Make sure the sidebar shows the directory tree containing the open
+        file and highlights it. For files opened on their own (not via a wiki
+        folder) the tree is rooted at the file's parent directory so the user
+        always sees where the document lives."""
+        if self.current_folder and _is_within(path, self.current_folder):
+            self._select_file_in_tree(path)
             return
-        try:
-            if not path.is_relative_to(self.current_folder):
-                return
-        except AttributeError:
-            if self.current_folder not in path.parents and path != self.current_folder:
-                return
+
+        folder = path.parent
+        self.current_folder = folder
+        root_index = self.file_model.setRootPath(str(folder))
+        self.tree.setRootIndex(root_index)
+        self.tree.expand(root_index)
+        self.folder_search_action.setEnabled(True)
+        self._select_file_in_tree(path)
+        # The model loads directory entries asynchronously, so re-select once it
+        # has had a chance to populate the (possibly nested) path.
+        QTimer.singleShot(60, lambda: self._select_file_in_tree(path))
+
+    def _select_file_in_tree(self, path: Path) -> None:
+        if not self.current_folder or not _is_within(path, self.current_folder):
+            return
 
         index = self.file_model.index(str(path))
         if index.isValid():
             self.tree.setCurrentIndex(index)
             self.tree.scrollTo(index)
+            # Reveal the folder tree leading down to the file.
+            parent = index.parent()
+            while parent.isValid():
+                self.tree.expand(parent)
+                parent = parent.parent()
 
     def _find_start_file(self, folder: Path) -> Path | None:
         for name in ("index.md", "README.md", "readme.md", "Index.md"):
@@ -795,8 +973,13 @@ class MainWindow(QMainWindow):
             QTreeView::item {{ padding: 4px 6px; border-radius: 6px; }}
             QTreeView::item:hover {{ background: {c['hover']}; }}
             QTreeView::item:selected {{ background: {c['sel']}; color: {c['text']}; }}
-            QSplitter::handle {{ background: {c['border']}; }}
-            QSplitter::handle:horizontal {{ width: 1px; }}
+            QSplitter::handle {{ background: {c['panel']}; }}
+            QSplitter::handle:horizontal {{ width: 12px; border-left: 1px solid {c['border']}; }}
+            QToolButton#sidebarToggle {{
+                border: none; background: transparent; color: {c['muted']};
+                font-size: 15px; font-weight: bold; border-radius: 4px;
+            }}
+            QToolButton#sidebarToggle:hover {{ background: {c['hover']}; color: {c['text']}; }}
             QStatusBar {{ background: {c['panel']}; color: {c['muted']}; border-top: 1px solid {c['border']}; }}
             QStatusBar::item {{ border: none; }}
             QProgressBar {{
@@ -870,6 +1053,8 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.web_page.current_markdown_path = None
         self.edit_action.setEnabled(False)
+        self.export_pdf_action.setEnabled(False)
+        self.export_docx_action.setEnabled(False)
         self._display(self.viewer, html, path)
         self.setWindowTitle(f"{APP_NAME} - {path.name}")
 
@@ -877,7 +1062,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "О программе",
-            f"MD Reader {__version__}\n\nПростой просмотрщик и редактор Markdown-файлов и локальных wiki.",
+            f"<h3>MD Reader</h3>"
+            f"<p>Версия {__version__}</p>"
+            "<p>Просмотрщик и редактор Markdown-файлов и локальных wiki.</p>"
+            "<p><b>Разработчик:</b> Pavel Maksimov</p>",
         )
 
     def _error(self, title: str, text: str) -> None:
@@ -935,6 +1123,16 @@ class FolderSearchDialog(QDialog):
         if path:
             self.file_chosen.emit(Path(path))
             self.accept()
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    """True when ``path`` is ``base`` itself or lives somewhere under it."""
+    if path == base:
+        return True
+    try:
+        return path.is_relative_to(base)
+    except AttributeError:  # Python < 3.9 fallback
+        return base in path.parents
 
 
 def _safe_relative(path: Path, base: Path) -> str:

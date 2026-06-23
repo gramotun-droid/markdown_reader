@@ -26,6 +26,7 @@ jobs:
             "markdown-it-py[linkify]>=3.0,<4" \
             "mdit-py-plugins>=0.4,<1" \
             "Pygments>=2.17,<3" \
+            "python-docx>=1.1,<2" \
             "pytest>=8.0,<9" \
             "ruff>=0.6"
 

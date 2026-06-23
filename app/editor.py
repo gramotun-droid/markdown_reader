@@ -11,10 +11,8 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -86,11 +84,17 @@ class MarkdownHighlighter(QSyntaxHighlighter):
 
 
 class MarkdownEditor(QWidget):
-    """Editor pane: toolbar with Save/Cancel/Undo/Redo plus the text area."""
+    """Editor pane: a thin header showing the file path plus the text area.
+
+    All editing commands (save, cancel, undo, redo) live in the window's
+    "Правка" menu rather than on in-pane buttons, so this widget only exposes
+    signals/methods the menu actions drive."""
 
     save_requested = Signal()
     cancel_requested = Signal()
     content_changed = Signal()
+    undo_available = Signal(bool)
+    redo_available = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None, dark: bool = False) -> None:
         super().__init__(parent)
@@ -110,41 +114,17 @@ class MarkdownEditor(QWidget):
 
         self.path_label = QLabel("", self)
         self.path_label.setObjectName("editorPathLabel")
+        self.path_label.setContentsMargins(8, 6, 8, 6)
 
-        self.save_button = QPushButton("Сохранить", self)
-        self.save_button.setShortcut("Ctrl+S")
-        self.save_button.clicked.connect(self.save_requested)
-
-        self.cancel_button = QPushButton("Отменить", self)
-        self.cancel_button.clicked.connect(self.cancel_requested)
-
-        self.undo_button = QPushButton("Отменить шаг", self)
-        self.undo_button.setShortcut("Ctrl+Z")
-        self.undo_button.setEnabled(False)
-        self.undo_button.clicked.connect(self.editor.undo)
-
-        self.redo_button = QPushButton("Повторить шаг", self)
-        self.redo_button.setShortcut("Ctrl+Shift+Z")
-        self.redo_button.setEnabled(False)
-        self.redo_button.clicked.connect(self.editor.redo)
-
-        self.editor.undoAvailable.connect(self.undo_button.setEnabled)
-        self.editor.redoAvailable.connect(self.redo_button.setEnabled)
-
-        toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(8, 6, 8, 6)
-        toolbar.addWidget(self.save_button)
-        toolbar.addWidget(self.cancel_button)
-        toolbar.addSpacing(12)
-        toolbar.addWidget(self.undo_button)
-        toolbar.addWidget(self.redo_button)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.path_label)
+        # Re-emit the editor's availability signals so the menu actions can
+        # enable/disable themselves without reaching into the QPlainTextEdit.
+        self.editor.undoAvailable.connect(self.undo_available)
+        self.editor.redoAvailable.connect(self.redo_available)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addLayout(toolbar)
+        layout.addWidget(self.path_label)
         layout.addWidget(self.editor, 1)
 
     def load(self, text: str, label: str = "") -> None:
@@ -152,8 +132,14 @@ class MarkdownEditor(QWidget):
         self.editor.document().clearUndoRedoStacks()
         self.editor.document().setModified(False)
         self.path_label.setText(label)
-        self.undo_button.setEnabled(False)
-        self.redo_button.setEnabled(False)
+        self.undo_available.emit(False)
+        self.redo_available.emit(False)
+
+    def undo(self) -> None:
+        self.editor.undo()
+
+    def redo(self) -> None:
+        self.editor.redo()
 
     def text(self) -> str:
         return self.editor.toPlainText()
