@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QSplitterHandle,
@@ -227,18 +227,12 @@ class MainWindow(QMainWindow):
         self._update_in_progress = False
         self._update_silent = True
         self._latest_update: UpdateInfo | None = None
-
-        self._update_progress = QProgressBar(self)
-        self._update_progress.setRange(0, 100)
-        self._update_progress.setMaximumWidth(220)
-        self._update_progress.setTextVisible(True)
-        self._update_progress.hide()
-        self.statusBar().addPermanentWidget(self._update_progress)
+        self._progress_dialog: QProgressDialog | None = None
 
         self._update_signals = _UpdateSignals()
         self._update_signals.check_done.connect(self._on_update_checked)
         self._update_signals.check_failed.connect(self._on_update_check_failed)
-        self._update_signals.progress.connect(self._update_progress.setValue)
+        self._update_signals.progress.connect(self._set_progress_value)
         self._update_signals.download_done.connect(self._on_update_downloaded)
         self._update_signals.download_failed.connect(self._on_update_download_failed)
 
@@ -246,20 +240,38 @@ class MainWindow(QMainWindow):
             # Defer so the window paints first; the check runs off the GUI thread.
             QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
 
-    def _show_update_activity(self, text: str) -> None:
-        """Show an indeterminate ('busy') progress bar in the status bar so the
-        user can see that a check/download is actually running."""
-        self._update_progress.setRange(0, 0)  # marquee / busy animation
-        self._update_progress.setFormat(text)
-        self._update_progress.setTextVisible(True)
-        self._update_progress.show()
-        self.statusBar().showMessage(text)
+    def _show_progress_dialog(self, label: str, *, busy: bool) -> None:
+        """A clearly visible modeless dialog with a label and progress bar, so
+        the user can always see that a check/download is happening."""
+        if self._progress_dialog is None:
+            dialog = QProgressDialog(label, "", 0, 0, self)
+            dialog.setCancelButton(None)  # no cancel — updates run to completion
+            dialog.setWindowTitle("Обновление MD Reader")
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setMinimumWidth(380)
+            self._progress_dialog = dialog
+        dialog = self._progress_dialog
+        dialog.setLabelText(label)
+        if busy:
+            dialog.setRange(0, 0)  # marquee / indeterminate
+        else:
+            dialog.setRange(0, 100)
+            dialog.setValue(0)
+        dialog.show()
+        dialog.raise_()
+
+    def _set_progress_value(self, value: int) -> None:
+        if self._progress_dialog is not None and self._progress_dialog.maximum() != 0:
+            self._progress_dialog.setValue(value)
 
     def _finish_update_activity(self) -> None:
-        self._update_progress.setRange(0, 100)
-        self._update_progress.reset()
-        self._update_progress.hide()
         self.statusBar().clearMessage()
+        if self._progress_dialog is not None:
+            self._progress_dialog.reset()
+            self._progress_dialog.hide()
 
     def check_for_updates(self, silent: bool = False) -> None:
         if self._update_in_progress:
@@ -269,7 +281,7 @@ class MainWindow(QMainWindow):
         if not silent:
             # Always-visible "checking" indicator (the request can take up to
             # ~10s), so the user is never left wondering whether it worked.
-            self._show_update_activity("Проверка обновлений…")
+            self._show_progress_dialog("Проверка обновлений…", busy=True)
         threading.Thread(target=self._run_update_check, daemon=True).start()
 
     def _run_update_check(self) -> None:
@@ -312,12 +324,9 @@ class MainWindow(QMainWindow):
 
     def _start_update_download(self, info: UpdateInfo) -> None:
         dest = str(Path(tempfile.gettempdir()) / (info.asset_name or INSTALLER_ASSET))
-        # Switch from the busy "checking" bar to a determinate download bar.
-        self._update_progress.setRange(0, 100)
-        self._update_progress.setValue(0)
-        self._update_progress.setFormat(f"Загрузка обновления {info.tag} — %p%")
-        self._update_progress.setTextVisible(True)
-        self._update_progress.show()
+        # Show a visible, determinate download bar — even for silent startup
+        # checks, so an automatic update is never invisible to the user.
+        self._show_progress_dialog(f"Загрузка обновления MD Reader {info.tag}…", busy=False)
         self.statusBar().showMessage(f"Загрузка обновления MD Reader {info.tag}…")
         threading.Thread(
             target=self._run_update_download,
@@ -335,10 +344,23 @@ class MainWindow(QMainWindow):
 
     def _on_update_downloaded(self, path: str) -> None:
         self._finish_update_activity()
-        self.statusBar().showMessage("Установка обновления…")
-        # Launch the installer silently and quit so it can replace running files.
-        started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
         self._update_in_progress = False
+        tag = self._latest_update.tag if self._latest_update else ""
+        # Ask before installing instead of quitting on our own, so the update
+        # never looks like the app silently closing by itself.
+        answer = QMessageBox.question(
+            self,
+            "Обновление готово",
+            f"Загружено обновление MD Reader {tag}.\n\n"
+            "Установить сейчас? Приложение будет закрыто на время установки.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Обновление будет установлено позже", 6000)
+            return
+        self.statusBar().showMessage("Установка обновления…")
+        started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
         if started:
             QTimer.singleShot(200, QApplication.quit)
         else:
@@ -875,12 +897,14 @@ class MainWindow(QMainWindow):
         chain of parent folders down to the file stays visible."""
         self._reveal_target = path
         if not (self.current_folder and _is_within(path, self.current_folder)):
-            # current_folder stays the file's own folder (search scope), but the
-            # tree is rooted higher so the parent folders are shown too.
+            # current_folder stays the file's own folder (search scope). Populate
+            # and watch that folder, but display the tree from the very top —
+            # "Мой компьютер" on Windows (all drives + network locations such as
+            # \\wsl.localhost\...), "/" on Linux — so the whole parent chain is
+            # always visible.
             self.current_folder = path.parent
-            root = Path(path.anchor) if path.anchor else path.parent
-            self.file_model.setRootPath(str(root))
-            self.tree.setRootIndex(self.file_model.index(str(root)))
+            self.file_model.setRootPath(str(path.parent))
+            self.tree.setRootIndex(QModelIndex())
             self.folder_search_action.setEnabled(True)
         self._try_reveal()
 
