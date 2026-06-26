@@ -7,3 +7,8 @@ dist/
 *.pyc
 *.egg-info/
 installer_output/
+
+# Frontend (gravity-ui editor) — deps and the built bundle are produced by the
+# build (npm ci && npm run build), not committed.
+frontend/node_modules/
+app/assets/editor/

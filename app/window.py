@@ -44,6 +44,7 @@ from .icon import app_icon
 from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
 from .settings import APP_NAME, SUPPORTED_EXTENSIONS, TECHNICAL_DIRS, AppSettings
 from .updater import INSTALLER_ASSET, UpdateInfo, can_self_install, check_for_update, download_asset
+from .web_editor import WebMarkdownEditor, web_editor_available
 from .web_page import MarkdownWebPage
 
 
@@ -179,18 +180,26 @@ class MainWindow(QMainWindow):
         self.preview.setPage(MarkdownWebPage(self))
         self.preview.loadFinished.connect(partial(self._restore_scroll, self.preview))
 
-        self.editor = MarkdownEditor(self, dark=self.settings.theme == "dark")
-        self.editor.content_changed.connect(self._update_preview)
-
-        edit_page = QWidget(self)
-        edit_layout = QVBoxLayout(edit_page)
-        edit_layout.setContentsMargins(0, 0, 0, 0)
-        edit_layout.setSpacing(0)
-        edit_split = QSplitter(Qt.Orientation.Horizontal, edit_page)
-        edit_split.addWidget(self.editor)
-        edit_split.addWidget(self.preview)
-        edit_split.setSizes([600, 600])
-        edit_layout.addWidget(edit_split)
+        # Prefer the rich gravity-ui editor when its bundle is present; otherwise
+        # fall back to the plain-text editor with a live preview pane.
+        self._use_web_editor = web_editor_available()
+        if self._use_web_editor:
+            self.editor = WebMarkdownEditor(self, dark=self.settings.theme == "dark")
+            self.editor.save_requested.connect(self._save_edits)
+            self.editor.cancel_requested.connect(self._cancel_edits)
+            edit_page = self.editor  # full-width; the editor has its own preview
+        else:
+            self.editor = MarkdownEditor(self, dark=self.settings.theme == "dark")
+            self.editor.content_changed.connect(self._update_preview)
+            edit_page = QWidget(self)
+            edit_layout = QVBoxLayout(edit_page)
+            edit_layout.setContentsMargins(0, 0, 0, 0)
+            edit_layout.setSpacing(0)
+            edit_split = QSplitter(Qt.Orientation.Horizontal, edit_page)
+            edit_split.addWidget(self.editor)
+            edit_split.addWidget(self.preview)
+            edit_split.setSizes([600, 600])
+            edit_layout.addWidget(edit_split)
 
         self.stack = QStackedWidget(self)
         self.stack.addWidget(view_page)
@@ -461,7 +470,6 @@ class MainWindow(QMainWindow):
         self.export_docx_action.triggered.connect(self.export_docx)
 
         self.save_action = QAction("Сохранить", self)
-        self.save_action.setShortcut(QKeySequence.StandardKey.Save)
         self.save_action.setEnabled(False)
         self.save_action.triggered.connect(self._save_edits)
 
@@ -470,17 +478,25 @@ class MainWindow(QMainWindow):
         self.cancel_edit_action.triggered.connect(self._cancel_edits)
 
         self.undo_action = QAction("Отменить", self)
-        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.undo_action.setEnabled(False)
-        self.undo_action.triggered.connect(self.editor.undo)
 
         self.redo_action = QAction("Повторить", self)
-        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         self.redo_action.setEnabled(False)
-        self.redo_action.triggered.connect(self.editor.redo)
 
-        self.editor.undo_available.connect(self.undo_action.setEnabled)
-        self.editor.redo_available.connect(self.redo_action.setEnabled)
+        if self._use_web_editor:
+            # The gravity-ui editor owns its own keyboard (Ctrl+Z/Ctrl+S, …) and
+            # toolbar, so leave Ctrl+S free for the web view and keep the menu
+            # undo/redo disabled (they would otherwise swallow the shortcuts).
+            self.undo_action.setVisible(False)
+            self.redo_action.setVisible(False)
+        else:
+            self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+            self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+            self.undo_action.triggered.connect(self.editor.undo)
+            self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+            self.redo_action.triggered.connect(self.editor.redo)
+            self.editor.undo_available.connect(self.undo_action.setEnabled)
+            self.editor.redo_available.connect(self.redo_action.setEnabled)
 
         self.toggle_sidebar_action = QAction("Боковая панель", self)
         self.toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
@@ -671,8 +687,10 @@ class MainWindow(QMainWindow):
             self._error("Не удалось открыть файл для правки", str(exc))
             return
 
+        self.editor.set_dark(self.renderer.theme == "dark")
         self.editor.load(text, label=str(self.current_file))
-        self._render_preview(text)
+        if not self._use_web_editor:
+            self._render_preview(text)
         self.stack.setCurrentIndex(1)
         self.edit_action.setEnabled(False)
         self.save_action.setEnabled(True)
@@ -995,7 +1013,7 @@ class MainWindow(QMainWindow):
         self._sync_theme_action()
         self._apply_app_style()
 
-        if self.stack.currentIndex() == 1:
+        if self.stack.currentIndex() == 1 and not self._use_web_editor:
             self._render_preview(self.editor.text())
         if self.current_file:
             self.open_file(self.current_file, record_history=False)

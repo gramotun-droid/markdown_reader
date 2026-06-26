@@ -51,6 +51,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build editor frontend (gravity-ui)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

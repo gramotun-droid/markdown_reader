@@ -1,0 +1,24 @@
+{
+  "name": "mdreader-editor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@gravity-ui/markdown-editor": "^15",
+    "@gravity-ui/uikit": "^7",
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@vitejs/plugin-react": "^4",
+    "typescript": "^5",
+    "vite": "^5",
+    "vite-plugin-singlefile": "^2"
+  }
+}
