@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
@@ -14,6 +16,9 @@ datas = [
 ]
 # python-docx ships a default .docx template that must be bundled alongside it.
 datas += collect_data_files("docx")
+# The gravity-ui editor bundle (built by the frontend step), if present.
+if os.path.exists("app/assets/editor/index.html"):
+    datas.append(("app/assets/editor/index.html", "app/assets/editor"))
 
 hiddenimports = (
     collect_submodules("markdown_it")

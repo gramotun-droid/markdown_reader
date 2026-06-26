@@ -29,7 +29,7 @@ mdreader = "app.main:main"
 packages = ["app"]
 
 [tool.setuptools.package-data]
-app = ["assets/*", "templates/*"]
+app = ["assets/*", "assets/editor/*", "templates/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
