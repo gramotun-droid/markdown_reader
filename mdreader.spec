@@ -24,6 +24,7 @@ hiddenimports = (
     collect_submodules("markdown_it")
     + collect_submodules("mdit_py_plugins")
     + collect_submodules("docx")
+    + ["PySide6.QtNetwork"]  # single-instance local socket
 )
 
 a = Analysis(
