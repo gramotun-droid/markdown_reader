@@ -8,7 +8,6 @@ from pathlib import Path
 
 from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QObject, QProcess, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
-from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,6 +28,7 @@ from PySide6.QtWidgets import (
     QSplitterHandle,
     QStackedWidget,
     QSystemTrayIcon,
+    QTabWidget,
     QToolButton,
     QTreeView,
     QVBoxLayout,
@@ -36,16 +36,15 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .document_view import DocumentView
 from .drives import available_roots
-from .editor import MarkdownEditor
 from .export import ExportError, markdown_to_docx
 from .folder_search import search_markdown_files
 from .icon import app_icon
-from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
+from .renderer import MarkdownRenderer, read_text_with_fallback
 from .settings import APP_NAME, SUPPORTED_EXTENSIONS, TECHNICAL_DIRS, AppSettings
 from .updater import INSTALLER_ASSET, UpdateInfo, can_self_install, check_for_update, download_asset
-from .web_editor import WebMarkdownEditor, web_editor_available
-from .web_page import MarkdownWebPage
+from .web_editor import web_editor_available
 
 
 class _UpdateSignals(QObject):
@@ -128,13 +127,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = AppSettings.load()
         self.renderer = MarkdownRenderer(theme=self.settings.theme)
-        self.current_file: Path | None = None
         self.current_folder: Path | None = None
-
-        self._history: list[Path] = []
-        self._history_index = -1
-        self._pending_scroll: dict[int, int] = {}
-        self._suppress_watch = False
+        self._use_web_editor = web_editor_available()
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -156,58 +150,25 @@ class MainWindow(QMainWindow):
         for column in range(1, self.file_model.columnCount()):
             self.tree.hideColumn(column)
 
-        self.web_page = MarkdownWebPage(self)
-        self.web_page.open_markdown_callback = self.open_file
-        self.web_page.missing_file_callback = self._show_missing_link
-        self.web_page.pdfPrintingFinished.connect(self._on_pdf_finished)
+        # Tabs (one open document each), with a welcome screen shown when empty.
+        self.tabs = QTabWidget(self)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
 
-        self.viewer = QWebEngineView(self)
-        self.viewer.setPage(self.web_page)
-        self.viewer.setZoomFactor(self.settings.zoom_factor)
-        self.viewer.loadFinished.connect(partial(self._restore_scroll, self.viewer))
+        self.welcome = QWebEngineView(self)
 
-        self.search_panel = self._create_search_panel()
-        self.search_panel.hide()
-
-        view_page = QWidget(self)
-        view_layout = QVBoxLayout(view_page)
-        view_layout.setContentsMargins(0, 0, 0, 0)
-        view_layout.setSpacing(0)
-        view_layout.addWidget(self.search_panel)
-        view_layout.addWidget(self.viewer)
-
-        self.preview = QWebEngineView(self)
-        self.preview.setPage(MarkdownWebPage(self))
-        self.preview.loadFinished.connect(partial(self._restore_scroll, self.preview))
-
-        # Prefer the rich gravity-ui editor when its bundle is present; otherwise
-        # fall back to the plain-text editor with a live preview pane.
-        self._use_web_editor = web_editor_available()
-        if self._use_web_editor:
-            self.editor = WebMarkdownEditor(self, dark=self.settings.theme == "dark")
-            self.editor.save_requested.connect(self._save_edits)
-            self.editor.cancel_requested.connect(self._cancel_edits)
-            edit_page = self.editor  # full-width; the editor has its own preview
-        else:
-            self.editor = MarkdownEditor(self, dark=self.settings.theme == "dark")
-            self.editor.content_changed.connect(self._update_preview)
-            edit_page = QWidget(self)
-            edit_layout = QVBoxLayout(edit_page)
-            edit_layout.setContentsMargins(0, 0, 0, 0)
-            edit_layout.setSpacing(0)
-            edit_split = QSplitter(Qt.Orientation.Horizontal, edit_page)
-            edit_split.addWidget(self.editor)
-            edit_split.addWidget(self.preview)
-            edit_split.setSizes([600, 600])
-            edit_layout.addWidget(edit_split)
-
-        self.stack = QStackedWidget(self)
-        self.stack.addWidget(view_page)
-        self.stack.addWidget(edit_page)
+        self.right_stack = QStackedWidget(self)
+        self.right_stack.addWidget(self.welcome)  # index 0
+        self.right_stack.addWidget(self.tabs)  # index 1
 
         self.splitter = SidebarSplitter(self)
         self.splitter.addWidget(self.tree)
-        self.splitter.addWidget(self.stack)
+        self.splitter.addWidget(self.right_stack)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([300, 900])
@@ -219,169 +180,82 @@ class MainWindow(QMainWindow):
         self._watch_timer.setSingleShot(True)
         self._watch_timer.setInterval(150)
         self._watch_timer.timeout.connect(self._do_watch_reload)
+        self._changed_paths: set[str] = set()
 
         self._create_actions()
         self._create_menus()
         self._create_tray()
         self._apply_app_style()
         self._rebuild_recent_menu()
-        self._update_history_actions()
         self._show_welcome()
+        self._update_actions()
 
         self._init_updates()
 
-    # ----------------------------------------------------------------- updates
+    # --------------------------------------------------------------- tabs
 
-    def _init_updates(self) -> None:
-        self._update_in_progress = False
-        self._update_silent = True
-        self._latest_update: UpdateInfo | None = None
-        self._progress_dialog: QProgressDialog | None = None
+    def _active(self) -> DocumentView | None:
+        widget = self.tabs.currentWidget()
+        return widget if isinstance(widget, DocumentView) else None
 
-        self._update_signals = _UpdateSignals()
-        self._update_signals.check_done.connect(self._on_update_checked)
-        self._update_signals.check_failed.connect(self._on_update_check_failed)
-        self._update_signals.progress.connect(self._set_progress_value)
-        self._update_signals.download_done.connect(self._on_update_downloaded)
-        self._update_signals.download_failed.connect(self._on_update_download_failed)
+    def _tab_for(self, path: Path) -> DocumentView | None:
+        for index in range(self.tabs.count()):
+            doc = self.tabs.widget(index)
+            if isinstance(doc, DocumentView) and doc.current_file == path:
+                return doc
+        return None
 
-        if self.settings.check_updates_on_start:
-            # Defer so the window paints first; the check runs off the GUI thread.
-            QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
+    def _new_document(self) -> DocumentView:
+        doc = DocumentView(self.renderer, use_web_editor=self._use_web_editor, zoom_factor=self.settings.zoom_factor)
+        doc.open_request.connect(self.open_file)
+        doc.missing_link.connect(self._show_missing_link)
+        doc.status_message.connect(self.statusBar().showMessage)
+        doc.title_changed.connect(partial(self._update_tab_title, doc))
+        doc.state_changed.connect(partial(self._on_doc_state_changed, doc))
+        return doc
 
-    def _show_progress_dialog(self, label: str, *, busy: bool) -> None:
-        """A clearly visible modeless dialog with a label and progress bar, so
-        the user can always see that a check/download is happening."""
-        if self._progress_dialog is None:
-            dialog = QProgressDialog(label, "", 0, 0, self)
-            dialog.setCancelButton(None)  # no cancel — updates run to completion
-            dialog.setWindowTitle("Обновление MD Reader")
-            dialog.setWindowModality(Qt.WindowModality.NonModal)
-            dialog.setMinimumDuration(0)
-            dialog.setAutoClose(False)
-            dialog.setAutoReset(False)
-            dialog.setMinimumWidth(380)
-            self._progress_dialog = dialog
-        dialog = self._progress_dialog
-        dialog.setLabelText(label)
-        if busy:
-            dialog.setRange(0, 0)  # marquee / indeterminate
-        else:
-            dialog.setRange(0, 100)
-            dialog.setValue(0)
-        dialog.show()
-        dialog.raise_()
+    def _update_tab_title(self, doc: DocumentView) -> None:
+        index = self.tabs.indexOf(doc)
+        if index >= 0:
+            self.tabs.setTabText(index, doc.title())
+            self.tabs.setTabToolTip(index, doc.tooltip())
+        if doc is self._active():
+            self._update_window_title()
 
-    def _set_progress_value(self, value: int) -> None:
-        if self._progress_dialog is not None and self._progress_dialog.maximum() != 0:
-            self._progress_dialog.setValue(value)
+    def _on_doc_state_changed(self, doc: DocumentView) -> None:
+        if doc is self._active():
+            self._update_actions()
 
-    def _finish_update_activity(self) -> None:
-        self.statusBar().clearMessage()
-        if self._progress_dialog is not None:
-            self._progress_dialog.reset()
-            self._progress_dialog.hide()
+    def _on_tab_changed(self, _index: int) -> None:
+        doc = self._active()
+        self._update_actions()
+        self._update_window_title()
+        if doc and doc.current_file:
+            self._ensure_tree_for_file(doc.current_file)
 
-    def check_for_updates(self, silent: bool = False) -> None:
-        if self._update_in_progress:
-            return
-        self._update_in_progress = True
-        self._update_silent = silent
-        if not silent:
-            # Always-visible "checking" indicator (the request can take up to
-            # ~10s), so the user is never left wondering whether it worked.
-            self._show_progress_dialog("Проверка обновлений…", busy=True)
-        threading.Thread(target=self._run_update_check, daemon=True).start()
+    def _close_tab(self, index: int) -> None:
+        doc = self.tabs.widget(index)
+        if isinstance(doc, DocumentView) and doc.has_unsaved():
+            answer = QMessageBox.question(
+                self,
+                "Закрыть вкладку",
+                "В этом документе есть несохранённые изменения. Закрыть?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.tabs.removeTab(index)
+        if isinstance(doc, DocumentView):
+            doc.deleteLater()
+        self._resync_watch()
+        if self.tabs.count() == 0:
+            self._show_welcome()
+        self._update_actions()
 
-    def _run_update_check(self) -> None:
-        try:
-            info = check_for_update(__version__)
-        except Exception as exc:  # noqa: BLE001 - any failure is reported to the UI
-            self._update_signals.check_failed.emit(str(exc))
-        else:
-            self._update_signals.check_done.emit(info)
-
-    def _on_update_checked(self, info: object) -> None:
-        if info is None:
-            self._update_in_progress = False
-            self._finish_update_activity()
-            if not self._update_silent:
-                QMessageBox.information(
-                    self,
-                    "Обновления",
-                    f"У вас последняя версия MD Reader ({__version__}).",
-                )
-            return
-
-        self._latest_update = info  # type: ignore[assignment]
-        if can_self_install() and info.asset_url:  # type: ignore[attr-defined]
-            # Apply automatically in the background, no prompts.
-            self._start_update_download(info)  # type: ignore[arg-type]
-        else:
-            # From source or no installer asset: just point at the release page.
-            self._update_in_progress = False
-            self._finish_update_activity()
-            self.statusBar().showMessage(f"Доступна версия {info.tag}", 8000)  # type: ignore[attr-defined]
-            if not self._update_silent:
-                QDesktopServices.openUrl(QUrl(info.html_url))  # type: ignore[attr-defined]
-
-    def _on_update_check_failed(self, message: str) -> None:
-        self._update_in_progress = False
-        self._finish_update_activity()
-        if not self._update_silent:
-            self._error("Не удалось проверить обновления", message)
-
-    def _start_update_download(self, info: UpdateInfo) -> None:
-        dest = str(Path(tempfile.gettempdir()) / (info.asset_name or INSTALLER_ASSET))
-        # Show a visible, determinate download bar — even for silent startup
-        # checks, so an automatic update is never invisible to the user.
-        self._show_progress_dialog(f"Загрузка обновления MD Reader {info.tag}…", busy=False)
-        self.statusBar().showMessage(f"Загрузка обновления MD Reader {info.tag}…")
-        threading.Thread(
-            target=self._run_update_download,
-            args=(info.asset_url, dest),
-            daemon=True,
-        ).start()
-
-    def _run_update_download(self, url: str, dest: str) -> None:
-        try:
-            download_asset(url, Path(dest), progress=self._update_signals.progress.emit)
-        except Exception as exc:  # noqa: BLE001
-            self._update_signals.download_failed.emit(str(exc))
-        else:
-            self._update_signals.download_done.emit(dest)
-
-    def _on_update_downloaded(self, path: str) -> None:
-        self._finish_update_activity()
-        self._update_in_progress = False
-        tag = self._latest_update.tag if self._latest_update else ""
-        # Ask before installing instead of quitting on our own, so the update
-        # never looks like the app silently closing by itself.
-        answer = QMessageBox.question(
-            self,
-            "Обновление готово",
-            f"Загружено обновление MD Reader {tag}.\n\n"
-            "Установить сейчас? Приложение будет закрыто на время установки.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            self.statusBar().showMessage("Обновление будет установлено позже", 6000)
-            return
-        self.statusBar().showMessage("Установка обновления…")
-        started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
-        if started:
-            QTimer.singleShot(200, QApplication.quit)
-        else:
-            self._error("Не удалось запустить установщик обновления", path)
-
-    def _on_update_download_failed(self, message: str) -> None:
-        self._finish_update_activity()
-        self._update_in_progress = False
-        if not self._update_silent:
-            self._error("Не удалось загрузить обновление", message)
-        else:
-            self.statusBar().showMessage("Не удалось загрузить обновление", 6000)
+    def close_current_tab(self) -> None:
+        if self.tabs.count():
+            self._close_tab(self.tabs.currentIndex())
 
     # ------------------------------------------------------------------ open
 
@@ -394,35 +268,39 @@ class MainWindow(QMainWindow):
         else:
             self._error("Путь не найден", f"Не удалось найти: {path}")
 
-    def open_file(self, path: Path, record_history: bool = True) -> None:
+    def open_file(self, path: Path) -> None:
         path = path.resolve()
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             self._error("Неподдерживаемый файл", "Можно открывать только .md и .markdown файлы.")
             return
 
-        try:
-            rendered = self.renderer.render_file(path)
-        except OSError as exc:
-            self._error("Не удалось открыть файл", f"{path}\n\n{exc}")
-            return
-        except MarkdownRenderError as exc:
-            self._error("Ошибка Markdown", str(exc))
+        existing = self._tab_for(path)
+        if existing is not None:
+            self.right_stack.setCurrentWidget(self.tabs)
+            self.tabs.setCurrentWidget(existing)
+            self._post_open(path)
             return
 
-        self.current_file = path
+        doc = self._new_document()
+        index = self.tabs.addTab(doc, "…")
+        self.tabs.setCurrentIndex(index)
+        self.right_stack.setCurrentWidget(self.tabs)
+        if not doc.open(path):
+            self.tabs.removeTab(index)
+            doc.deleteLater()
+            if self.tabs.count() == 0:
+                self._show_welcome()
+            return
+        self._post_open(path)
+
+    def _post_open(self, path: Path) -> None:
         self.settings.last_path = path
         self.settings.remember_recent(path)
-        self.web_page.current_markdown_path = path
-        self._display(self.viewer, rendered.html, path.parent)
-        self.setWindowTitle(f"{APP_NAME} - {path.name}")
         self._ensure_tree_for_file(path)
-        self._watch(path)
+        self._resync_watch()
         self._rebuild_recent_menu()
-        if record_history:
-            self._record_history(path)
-        self.edit_action.setEnabled(True)
-        self.export_pdf_action.setEnabled(True)
-        self.export_docx_action.setEnabled(True)
+        self._update_actions()
+        self._update_window_title()
         self.settings.save()
 
     def open_folder(self, path: Path) -> None:
@@ -456,10 +334,14 @@ class MainWindow(QMainWindow):
         self.open_folder_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.open_folder_action.triggered.connect(self._choose_folder)
 
+        self.close_tab_action = QAction("Закрыть вкладку", self)
+        self.close_tab_action.setShortcut(QKeySequence.StandardKey.Close)  # Ctrl+W
+        self.close_tab_action.triggered.connect(self.close_current_tab)
+
         self.edit_action = QAction("Редактировать", self)
         self.edit_action.setShortcut(QKeySequence("Ctrl+E"))
         self.edit_action.setEnabled(False)
-        self.edit_action.triggered.connect(self.enter_edit_mode)
+        self.edit_action.triggered.connect(self._edit_active)
 
         self.export_pdf_action = QAction("В PDF…", self)
         self.export_pdf_action.setEnabled(False)
@@ -471,32 +353,15 @@ class MainWindow(QMainWindow):
 
         self.save_action = QAction("Сохранить", self)
         self.save_action.setEnabled(False)
-        self.save_action.triggered.connect(self._save_edits)
+        self.save_action.triggered.connect(self._save_active)
+        if not self._use_web_editor:
+            # The web editor handles Ctrl+S itself; the plain editor needs the
+            # window-level shortcut to drive saving.
+            self.save_action.setShortcut(QKeySequence.StandardKey.Save)
 
         self.cancel_edit_action = QAction("Отменить правки", self)
         self.cancel_edit_action.setEnabled(False)
-        self.cancel_edit_action.triggered.connect(self._cancel_edits)
-
-        self.undo_action = QAction("Отменить", self)
-        self.undo_action.setEnabled(False)
-
-        self.redo_action = QAction("Повторить", self)
-        self.redo_action.setEnabled(False)
-
-        if self._use_web_editor:
-            # The gravity-ui editor owns its own keyboard (Ctrl+Z/Ctrl+S, …) and
-            # toolbar, so leave Ctrl+S free for the web view and keep the menu
-            # undo/redo disabled (they would otherwise swallow the shortcuts).
-            self.undo_action.setVisible(False)
-            self.redo_action.setVisible(False)
-        else:
-            self.save_action.setShortcut(QKeySequence.StandardKey.Save)
-            self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-            self.undo_action.triggered.connect(self.editor.undo)
-            self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
-            self.redo_action.triggered.connect(self.editor.redo)
-            self.editor.undo_available.connect(self.undo_action.setEnabled)
-            self.editor.redo_available.connect(self.redo_action.setEnabled)
+        self.cancel_edit_action.triggered.connect(self._cancel_active)
 
         self.toggle_sidebar_action = QAction("Боковая панель", self)
         self.toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
@@ -507,7 +372,7 @@ class MainWindow(QMainWindow):
 
         self.find_action = QAction("Поиск на странице", self)
         self.find_action.setShortcut(QKeySequence.StandardKey.Find)
-        self.find_action.triggered.connect(self._show_search)
+        self.find_action.triggered.connect(self._find_in_active)
 
         self.folder_search_action = QAction("Поиск по папке", self)
         self.folder_search_action.setShortcut(QKeySequence("Ctrl+Shift+F"))
@@ -516,15 +381,15 @@ class MainWindow(QMainWindow):
 
         self.refresh_action = QAction("Обновить", self)
         self.refresh_action.setShortcut(QKeySequence("Ctrl+R"))
-        self.refresh_action.triggered.connect(self.refresh_current)
+        self.refresh_action.triggered.connect(self._refresh_active)
 
         self.back_action = QAction("Назад", self)
         self.back_action.setShortcut(QKeySequence("Alt+Left"))
-        self.back_action.triggered.connect(self.navigate_back)
+        self.back_action.triggered.connect(self._back_active)
 
         self.forward_action = QAction("Вперёд", self)
         self.forward_action.setShortcut(QKeySequence("Alt+Right"))
-        self.forward_action.triggered.connect(self.navigate_forward)
+        self.forward_action.triggered.connect(self._forward_active)
 
         self.theme_action = QAction("Тёмная тема", self)
         self.theme_action.setShortcut(QKeySequence("Ctrl+Shift+D"))
@@ -561,6 +426,7 @@ class MainWindow(QMainWindow):
         export_menu.addAction(self.export_pdf_action)
         export_menu.addAction(self.export_docx_action)
         file_menu.addSeparator()
+        file_menu.addAction(self.close_tab_action)
         file_menu.addAction(self.exit_action)
 
         edit_menu = self.menuBar().addMenu("Правка")
@@ -568,9 +434,6 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.save_action)
         edit_menu.addAction(self.cancel_edit_action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(self.undo_action)
-        edit_menu.addAction(self.redo_action)
 
         view_menu = self.menuBar().addMenu("Вид")
         view_menu.addAction(self.toggle_sidebar_action)
@@ -649,158 +512,95 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def _create_search_panel(self) -> QWidget:
-        panel = QWidget(self)
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(8, 6, 8, 6)
+    # --------------------------------------------- active-tab action routing
 
-        label = QLabel("Поиск:", panel)
-        self.search_input = QLineEdit(panel)
-        self.search_input.setPlaceholderText("Введите текст")
-        self.search_input.textChanged.connect(self._find_text)
-        self.search_input.returnPressed.connect(self._find_next)
+    def _edit_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.enter_edit_mode()
 
-        previous_button = QPushButton("Назад", panel)
-        previous_button.clicked.connect(self._find_previous)
+    def _save_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.save()
 
-        next_button = QPushButton("Далее", panel)
-        next_button.clicked.connect(self._find_next)
+    def _cancel_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.cancel_edit()
 
-        close_button = QPushButton("Закрыть", panel)
-        close_button.clicked.connect(self._hide_search)
+    def _refresh_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.refresh()
+        else:
+            self.statusBar().showMessage("Нет открытого документа", 3000)
 
-        layout.addWidget(label)
-        layout.addWidget(self.search_input, 1)
-        layout.addWidget(previous_button)
-        layout.addWidget(next_button)
-        layout.addWidget(close_button)
-        return panel
+    def _back_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.navigate_back()
 
-    # ----------------------------------------------------------- edit mode
+    def _forward_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.navigate_forward()
 
-    def enter_edit_mode(self) -> None:
-        if not self.current_file:
-            return
-        try:
-            text = read_text_with_fallback(self.current_file)
-        except (OSError, UnicodeDecodeError) as exc:
-            self._error("Не удалось открыть файл для правки", str(exc))
-            return
+    def _find_in_active(self) -> None:
+        doc = self._active()
+        if doc:
+            doc.show_search()
 
-        self.editor.set_dark(self.renderer.theme == "dark")
-        self.editor.load(text, label=str(self.current_file))
-        if not self._use_web_editor:
-            self._render_preview(text)
-        self.stack.setCurrentIndex(1)
-        self.edit_action.setEnabled(False)
-        self.save_action.setEnabled(True)
-        self.cancel_edit_action.setEnabled(True)
-        self.editor.focus_editor()
+    def _update_actions(self) -> None:
+        doc = self._active()
+        has_doc = doc is not None and doc.current_file is not None
+        editing = bool(doc and doc.is_editing())
+        self.edit_action.setEnabled(bool(doc and doc.can_edit()) and not editing)
+        self.save_action.setEnabled(editing)
+        self.cancel_edit_action.setEnabled(editing)
+        self.export_pdf_action.setEnabled(has_doc)
+        self.export_docx_action.setEnabled(has_doc)
+        self.refresh_action.setEnabled(has_doc)
+        self.find_action.setEnabled(has_doc)
+        self.back_action.setEnabled(bool(doc and doc.can_go_back()))
+        self.forward_action.setEnabled(bool(doc and doc.can_go_forward()))
 
-    def _update_preview(self) -> None:
-        # Capture the preview scroll position before re-rendering so typing
-        # does not jump the preview back to the top.
-        self.preview.page().runJavaScript("window.scrollY", 0, self._render_preview_at)
-
-    def _render_preview_at(self, scroll_y) -> None:
-        self._render_preview(self.editor.text(), scroll_to=int(scroll_y or 0))
-
-    def _render_preview(self, text: str, scroll_to: int = 0) -> None:
-        try:
-            html = self.renderer.render_text(text, title="preview").html
-        except MarkdownRenderError:
-            return
-        base = self.current_file.parent if self.current_file else Path.cwd()
-        self._display(self.preview, html, base, scroll_to=scroll_to)
-
-    def _save_edits(self) -> None:
-        if not self.current_file:
-            return
-        text = self.editor.text()
-        try:
-            self._suppress_watch = True
-            self.current_file.write_text(text, encoding="utf-8")
-        except OSError as exc:
-            self._error("Не удалось сохранить файл", f"{self.current_file}\n\n{exc}")
-            self._suppress_watch = False
-            return
-        self.editor.mark_saved()
-        QTimer.singleShot(300, self._release_watch)
-        self._exit_edit_mode()
-        self.open_file(self.current_file, record_history=False)
-
-    def _cancel_edits(self) -> None:
-        if self.editor.is_modified():
-            answer = QMessageBox.question(
-                self,
-                "Отменить правки",
-                "Несохранённые изменения будут потеряны. Закрыть редактор?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-        self._exit_edit_mode()
-
-    def _exit_edit_mode(self) -> None:
-        self.stack.setCurrentIndex(0)
-        self.edit_action.setEnabled(self.current_file is not None)
-        self.save_action.setEnabled(False)
-        self.cancel_edit_action.setEnabled(False)
-        self.viewer.setFocus()
-
-    def _release_watch(self) -> None:
-        self._suppress_watch = False
+    def _update_window_title(self) -> None:
+        doc = self._active()
+        if doc and doc.current_file:
+            self.setWindowTitle(f"{APP_NAME} - {doc.current_file.name}")
+        else:
+            self.setWindowTitle(APP_NAME)
 
     # ------------------------------------------------------------- watcher
 
-    def _watch(self, path: Path) -> None:
+    def _resync_watch(self) -> None:
         existing = self.watcher.files()
         if existing:
             self.watcher.removePaths(existing)
-        self.watcher.addPath(str(path))
+        paths = {
+            str(self.tabs.widget(i).current_file)
+            for i in range(self.tabs.count())
+            if isinstance(self.tabs.widget(i), DocumentView) and self.tabs.widget(i).current_file
+        }
+        if paths:
+            self.watcher.addPaths(list(paths))
 
-    def _on_file_changed(self, _path: str) -> None:
-        if self._suppress_watch or self.stack.currentIndex() == 1:
-            return
+    def _on_file_changed(self, path: str) -> None:
+        self._changed_paths.add(path)
         self._watch_timer.start()
 
     def _do_watch_reload(self) -> None:
-        if not self.current_file:
-            return
-        if not self.current_file.exists():
-            return
-        if str(self.current_file) not in self.watcher.files():
-            self.watcher.addPath(str(self.current_file))
-        self.refresh_current()
-
-    # ---------------------------------------------------------- navigation
-
-    def _record_history(self, path: Path) -> None:
-        if self._history and self._history[self._history_index] == path:
-            return
-        del self._history[self._history_index + 1:]
-        self._history.append(path)
-        self._history_index = len(self._history) - 1
-        self._update_history_actions()
-
-    def navigate_back(self) -> None:
-        if self._history_index <= 0:
-            return
-        self._history_index -= 1
-        self.open_file(self._history[self._history_index], record_history=False)
-        self._update_history_actions()
-
-    def navigate_forward(self) -> None:
-        if self._history_index >= len(self._history) - 1:
-            return
-        self._history_index += 1
-        self.open_file(self._history[self._history_index], record_history=False)
-        self._update_history_actions()
-
-    def _update_history_actions(self) -> None:
-        self.back_action.setEnabled(self._history_index > 0)
-        self.forward_action.setEnabled(self._history_index < len(self._history) - 1)
+        changed = self._changed_paths
+        self._changed_paths = set()
+        for index in range(self.tabs.count()):
+            doc = self.tabs.widget(index)
+            if not isinstance(doc, DocumentView) or not doc.current_file:
+                continue
+            if str(doc.current_file) in changed and doc.current_file.exists() and doc.wants_external_reload():
+                doc.refresh()
+        # Some editors replace files, dropping the watch; re-arm it.
+        self._resync_watch()
 
     # ------------------------------------------------------------- recent
 
@@ -844,34 +644,27 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- export
 
     def export_pdf(self) -> None:
-        if not self.current_file:
+        doc = self._active()
+        if not doc or not doc.current_file:
             return
-        default = str(self.current_file.with_suffix(".pdf"))
+        default = str(doc.current_file.with_suffix(".pdf"))
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт в PDF", default, "PDF (*.pdf)")
         if not path:
             return
         self.statusBar().showMessage("Экспорт в PDF…")
-        # printToPdf renders the page currently shown in the viewer, so the
-        # result matches what the user sees. Completion arrives via the
-        # pdfPrintingFinished signal connected in __init__.
-        self.viewer.page().printToPdf(path)
-
-    def _on_pdf_finished(self, path: str, ok: bool) -> None:
-        if ok:
-            self.statusBar().showMessage(f"Сохранено в PDF: {path}", 6000)
-        else:
-            self._error("Не удалось экспортировать PDF", path)
+        doc.export_pdf(path)
 
     def export_docx(self) -> None:
-        if not self.current_file:
+        doc = self._active()
+        if not doc or not doc.current_file:
             return
-        default = str(self.current_file.with_suffix(".docx"))
+        default = str(doc.current_file.with_suffix(".docx"))
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт в Word", default, "Word (*.docx)")
         if not path:
             return
         try:
-            text = read_text_with_fallback(self.current_file)
-            markdown_to_docx(text, Path(path), title=self.current_file.stem)
+            text = read_text_with_fallback(doc.current_file)
+            markdown_to_docx(text, Path(path), title=doc.current_file.stem)
         except (OSError, UnicodeDecodeError) as exc:
             self._error("Не удалось экспортировать DOCX", f"{path}\n\n{exc}")
             return
@@ -909,17 +702,11 @@ class MainWindow(QMainWindow):
             self.open_file(path)
 
     def _ensure_tree_for_file(self, path: Path) -> None:
-        """Make sure the sidebar shows the directory tree containing the open
-        file and highlights it. For files opened on their own (not via a wiki
-        folder) the tree is rooted at the filesystem/drive root so the whole
-        chain of parent folders down to the file stays visible."""
+        """Show the directory tree containing the open file and highlight it.
+        For files outside a wiki folder the tree is rooted at the filesystem /
+        drive top so the whole chain of parent folders stays visible."""
         self._reveal_target = path
         if not (self.current_folder and _is_within(path, self.current_folder)):
-            # current_folder stays the file's own folder (search scope). Populate
-            # and watch that folder, but display the tree from the very top —
-            # "Мой компьютер" on Windows (all drives + network locations such as
-            # \\wsl.localhost\...), "/" on Linux — so the whole parent chain is
-            # always visible.
             self.current_folder = path.parent
             self.file_model.setRootPath(str(path.parent))
             self.tree.setRootIndex(QModelIndex())
@@ -927,19 +714,17 @@ class MainWindow(QMainWindow):
         self._try_reveal()
 
     def _on_directory_loaded(self, _loaded_path: str) -> None:
-        # Each lazily-loaded level may finally expose the target file.
         self._try_reveal()
 
     def _try_reveal(self) -> None:
         target = self._reveal_target
         if target is not None and self._select_file_in_tree(target):
-            self._reveal_target = None  # revealed; stop hijacking later loads
+            self._reveal_target = None
 
     def _select_file_in_tree(self, path: Path) -> bool:
         index = self.file_model.index(str(path))
         if not index.isValid():
             return False
-        # Expand the whole chain of parent folders so the path is revealed.
         parent = index.parent()
         while parent.isValid():
             self.tree.expand(parent)
@@ -970,36 +755,21 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- view/zoom
 
-    def refresh_current(self) -> None:
-        if not self.current_file:
-            self.statusBar().showMessage("Нет открытого файла для обновления", 3000)
-            return
-        self.viewer.page().runJavaScript("window.scrollY", 0, self._refresh_at)
-
-    def _refresh_at(self, scroll_y) -> None:
-        if not self.current_file:
-            return
-        try:
-            rendered = self.renderer.render_file(self.current_file)
-        except (OSError, MarkdownRenderError) as exc:
-            self._error("Не удалось обновить", str(exc))
-            return
-        self._display(self.viewer, rendered.html, self.current_file.parent, scroll_to=int(scroll_y or 0))
-        self.statusBar().showMessage(f"Обновлено: {self.current_file.name}", 2000)
-
     def zoom_in(self) -> None:
-        self._set_zoom(min(self.viewer.zoomFactor() + 0.1, 3.0))
+        self._set_zoom(min(self.settings.zoom_factor + 0.1, 3.0))
 
     def zoom_out(self) -> None:
-        self._set_zoom(max(self.viewer.zoomFactor() - 0.1, 0.25))
+        self._set_zoom(max(self.settings.zoom_factor - 0.1, 0.25))
 
     def zoom_reset(self) -> None:
         self._set_zoom(1.0)
 
     def _set_zoom(self, factor: float) -> None:
-        self.viewer.setZoomFactor(factor)
-        self.preview.setZoomFactor(factor)
         self.settings.zoom_factor = factor
+        for index in range(self.tabs.count()):
+            doc = self.tabs.widget(index)
+            if isinstance(doc, DocumentView):
+                doc.set_zoom(factor)
         self.settings.save()
 
     # -------------------------------------------------------------- theme
@@ -1009,15 +779,13 @@ class MainWindow(QMainWindow):
         self.renderer.set_theme(new_theme)
         self.settings.theme = new_theme
         self.settings.save()
-        self.editor.set_dark(new_theme == "dark")
         self._sync_theme_action()
         self._apply_app_style()
-
-        if self.stack.currentIndex() == 1 and not self._use_web_editor:
-            self._render_preview(self.editor.text())
-        if self.current_file:
-            self.open_file(self.current_file, record_history=False)
-        else:
+        for index in range(self.tabs.count()):
+            doc = self.tabs.widget(index)
+            if isinstance(doc, DocumentView):
+                doc.apply_theme()
+        if self.tabs.count() == 0:
             self._show_welcome()
 
     def _sync_theme_action(self) -> None:
@@ -1025,8 +793,8 @@ class MainWindow(QMainWindow):
 
     def _apply_app_style(self) -> None:
         """A light, theme-aware Qt stylesheet for the window chrome (sidebar,
-        splitter, status bar, scrollbars). The rendered Markdown keeps its own
-        CSS; this only dresses up the surrounding native widgets."""
+        tabs, splitter, status bar, scrollbars). The rendered Markdown keeps its
+        own CSS; this only dresses up the surrounding native widgets."""
         if self.renderer.theme == "dark":
             c = {
                 "bg": "#171a21", "panel": "#1b1f27", "text": "#e5e7eb",
@@ -1049,6 +817,17 @@ class MainWindow(QMainWindow):
             QTreeView::item {{ padding: 4px 6px; border-radius: 6px; }}
             QTreeView::item:hover {{ background: {c['hover']}; }}
             QTreeView::item:selected {{ background: {c['sel']}; color: {c['text']}; }}
+            QTabWidget::pane {{ border: none; }}
+            QTabBar {{ qproperty-drawBase: 0; }}
+            QTabBar::tab {{
+                background: {c['panel']}; color: {c['muted']};
+                border: 1px solid {c['border']}; border-bottom: none;
+                border-top-left-radius: 6px; border-top-right-radius: 6px;
+                padding: 6px 12px; margin-right: 2px; max-width: 240px;
+            }}
+            QTabBar::tab:selected {{ background: {c['bg']}; color: {c['text']}; }}
+            QTabBar::tab:hover {{ background: {c['hover']}; }}
+            QTabBar::close-button {{ subcontrol-position: right; }}
             QSplitter::handle {{ background: {c['panel']}; }}
             QSplitter::handle:horizontal {{ width: 12px; border-left: 1px solid {c['border']}; }}
             QToolButton#sidebarToggle {{
@@ -1071,67 +850,38 @@ class MainWindow(QMainWindow):
             """
         )
 
-    # ------------------------------------------------------------- search
-
-    def _show_search(self) -> None:
-        self.search_panel.show()
-        self.search_input.setFocus()
-        self.search_input.selectAll()
-
-    def _hide_search(self) -> None:
-        self.viewer.findText("")
-        self.search_panel.hide()
-        self.viewer.setFocus()
-
-    def _find_text(self, text: str) -> None:
-        self.viewer.findText(text)
-
-    def _find_next(self) -> None:
-        self.viewer.findText(self.search_input.text())
-
-    def _find_previous(self) -> None:
-        self.viewer.findText(self.search_input.text(), QWebEnginePage.FindFlag.FindBackward)
-
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Escape and self.search_panel.isVisible():
-            self._hide_search()
-            return
+        if event.key() == Qt.Key.Key_Escape:
+            doc = self._active()
+            if doc and doc.search_visible():
+                doc.hide_search()
+                return
         super().keyPressEvent(event)
 
-    # ----------------------------------------------------------- rendering
-
-    def _display(self, view: QWebEngineView, html: str, base_dir: Path, scroll_to: int = 0) -> None:
-        self._pending_scroll[id(view)] = scroll_to
-        view.setHtml(html, QUrl.fromLocalFile(str(base_dir) + "/"))
-
-    def _restore_scroll(self, view: QWebEngineView, ok: bool) -> None:
-        scroll_to = self._pending_scroll.pop(id(view), 0)
-        if ok and scroll_to:
-            view.page().runJavaScript(f"window.scrollTo(0, {scroll_to});")
-
     # ------------------------------------------------------------- screens
+
+    def _render_into_welcome(self, markdown: str, title: str) -> None:
+        html = self.renderer.render_text(markdown, title=title).html
+        self.welcome.setHtml(html, QUrl.fromLocalFile(str(Path.cwd()) + "/"))
 
     def _show_missing_link(self, path: Path) -> None:
         self._error("Файл не найден", f"Ссылка ведёт на несуществующий файл:\n{path}")
 
     def _show_welcome(self) -> None:
-        html = self.renderer.render_text(
-            "# MD Reader\n\nОткройте Markdown-файл или папку wiki через меню **Файл**.",
-            title="MD Reader",
-        ).html
-        self._display(self.viewer, html, Path.cwd())
+        self._render_into_welcome(
+            "# MD Reader\n\nОткройте Markdown-файл или папку wiki через меню **Файл**. "
+            "Документы открываются во вкладках вверху.",
+            "MD Reader",
+        )
+        self.right_stack.setCurrentWidget(self.welcome)
+        self._update_window_title()
 
     def _show_folder_empty(self, path: Path) -> None:
-        html = self.renderer.render_text(
+        self._render_into_welcome(
             f"# Папка открыта\n\nВ папке не найдено Markdown-файлов:\n\n`{path}`",
-            title="Папка открыта",
-        ).html
-        self.current_file = None
-        self.web_page.current_markdown_path = None
-        self.edit_action.setEnabled(False)
-        self.export_pdf_action.setEnabled(False)
-        self.export_docx_action.setEnabled(False)
-        self._display(self.viewer, html, path)
+            "Папка открыта",
+        )
+        self.right_stack.setCurrentWidget(self.welcome)
         self.setWindowTitle(f"{APP_NAME} - {path.name}")
 
     def _show_about(self) -> None:
@@ -1146,6 +896,151 @@ class MainWindow(QMainWindow):
 
     def _error(self, title: str, text: str) -> None:
         QMessageBox.warning(self, title, text)
+
+    # ----------------------------------------------------------------- updates
+
+    def _init_updates(self) -> None:
+        self._update_in_progress = False
+        self._update_silent = True
+        self._latest_update: UpdateInfo | None = None
+        self._progress_dialog: QProgressDialog | None = None
+
+        self._update_signals = _UpdateSignals()
+        self._update_signals.check_done.connect(self._on_update_checked)
+        self._update_signals.check_failed.connect(self._on_update_check_failed)
+        self._update_signals.progress.connect(self._set_progress_value)
+        self._update_signals.download_done.connect(self._on_update_downloaded)
+        self._update_signals.download_failed.connect(self._on_update_download_failed)
+
+        if self.settings.check_updates_on_start:
+            # Defer so the window paints first; the check runs off the GUI thread.
+            QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
+
+    def _show_progress_dialog(self, label: str, *, busy: bool) -> None:
+        """A clearly visible modeless dialog with a label and progress bar, so
+        the user can always see that a check/download is happening."""
+        if self._progress_dialog is None:
+            dialog = QProgressDialog(label, "", 0, 0, self)
+            dialog.setCancelButton(None)  # no cancel — updates run to completion
+            dialog.setWindowTitle("Обновление MD Reader")
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setMinimumWidth(380)
+            self._progress_dialog = dialog
+        dialog = self._progress_dialog
+        dialog.setLabelText(label)
+        if busy:
+            dialog.setRange(0, 0)  # marquee / indeterminate
+        else:
+            dialog.setRange(0, 100)
+            dialog.setValue(0)
+        dialog.show()
+        dialog.raise_()
+
+    def _set_progress_value(self, value: int) -> None:
+        if self._progress_dialog is not None and self._progress_dialog.maximum() != 0:
+            self._progress_dialog.setValue(value)
+
+    def _finish_update_activity(self) -> None:
+        self.statusBar().clearMessage()
+        if self._progress_dialog is not None:
+            self._progress_dialog.reset()
+            self._progress_dialog.hide()
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self._update_silent = silent
+        if not silent:
+            self._show_progress_dialog("Проверка обновлений…", busy=True)
+        threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def _run_update_check(self) -> None:
+        try:
+            info = check_for_update(__version__)
+        except Exception as exc:  # noqa: BLE001 - any failure is reported to the UI
+            self._update_signals.check_failed.emit(str(exc))
+        else:
+            self._update_signals.check_done.emit(info)
+
+    def _on_update_checked(self, info: object) -> None:
+        if info is None:
+            self._update_in_progress = False
+            self._finish_update_activity()
+            if not self._update_silent:
+                QMessageBox.information(
+                    self,
+                    "Обновления",
+                    f"У вас последняя версия MD Reader ({__version__}).",
+                )
+            return
+
+        self._latest_update = info  # type: ignore[assignment]
+        if can_self_install() and info.asset_url:  # type: ignore[attr-defined]
+            self._start_update_download(info)  # type: ignore[arg-type]
+        else:
+            self._update_in_progress = False
+            self._finish_update_activity()
+            self.statusBar().showMessage(f"Доступна версия {info.tag}", 8000)  # type: ignore[attr-defined]
+            if not self._update_silent:
+                QDesktopServices.openUrl(QUrl(info.html_url))  # type: ignore[attr-defined]
+
+    def _on_update_check_failed(self, message: str) -> None:
+        self._update_in_progress = False
+        self._finish_update_activity()
+        if not self._update_silent:
+            self._error("Не удалось проверить обновления", message)
+
+    def _start_update_download(self, info: UpdateInfo) -> None:
+        dest = str(Path(tempfile.gettempdir()) / (info.asset_name or INSTALLER_ASSET))
+        self._show_progress_dialog(f"Загрузка обновления MD Reader {info.tag}…", busy=False)
+        self.statusBar().showMessage(f"Загрузка обновления MD Reader {info.tag}…")
+        threading.Thread(
+            target=self._run_update_download,
+            args=(info.asset_url, dest),
+            daemon=True,
+        ).start()
+
+    def _run_update_download(self, url: str, dest: str) -> None:
+        try:
+            download_asset(url, Path(dest), progress=self._update_signals.progress.emit)
+        except Exception as exc:  # noqa: BLE001
+            self._update_signals.download_failed.emit(str(exc))
+        else:
+            self._update_signals.download_done.emit(dest)
+
+    def _on_update_downloaded(self, path: str) -> None:
+        self._finish_update_activity()
+        self._update_in_progress = False
+        tag = self._latest_update.tag if self._latest_update else ""
+        answer = QMessageBox.question(
+            self,
+            "Обновление готово",
+            f"Загружено обновление MD Reader {tag}.\n\n"
+            "Установить сейчас? Приложение будет закрыто на время установки.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Обновление будет установлено позже", 6000)
+            return
+        self.statusBar().showMessage("Установка обновления…")
+        started = QProcess.startDetached(path, ["/VERYSILENT", "/NORESTART"])
+        if started:
+            QTimer.singleShot(200, QApplication.quit)
+        else:
+            self._error("Не удалось запустить установщик обновления", path)
+
+    def _on_update_download_failed(self, message: str) -> None:
+        self._finish_update_activity()
+        self._update_in_progress = False
+        if not self._update_silent:
+            self._error("Не удалось загрузить обновление", message)
+        else:
+            self.statusBar().showMessage("Не удалось загрузить обновление", 6000)
 
 
 class FolderSearchDialog(QDialog):
