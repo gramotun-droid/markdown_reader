@@ -201,7 +201,7 @@ class MainWindow(QMainWindow):
     def _tab_for(self, path: Path) -> DocumentView | None:
         for index in range(self.tabs.count()):
             doc = self.tabs.widget(index)
-            if isinstance(doc, DocumentView) and doc.current_file == path:
+            if isinstance(doc, DocumentView) and (doc.current_file == path or doc.converted_source() == path):
                 return doc
         return None
 
@@ -212,6 +212,7 @@ class MainWindow(QMainWindow):
         doc.status_message.connect(self.statusBar().showMessage)
         doc.title_changed.connect(partial(self._update_tab_title, doc))
         doc.state_changed.connect(partial(self._on_doc_state_changed, doc))
+        doc.save_as_requested.connect(partial(self._save_converted_as_md, doc))
         return doc
 
     def _update_tab_title(self, doc: DocumentView) -> None:
@@ -235,16 +236,28 @@ class MainWindow(QMainWindow):
 
     def _close_tab(self, index: int) -> None:
         doc = self.tabs.widget(index)
-        if isinstance(doc, DocumentView) and doc.has_unsaved():
-            answer = QMessageBox.question(
-                self,
-                "Закрыть вкладку",
-                "В этом документе есть несохранённые изменения. Закрыть?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
+        if isinstance(doc, DocumentView):
+            if doc.is_converted() and doc.has_edits():
+                self._close_converted_doc(doc)
                 return
+            if doc.has_unsaved():
+                answer = QMessageBox.question(
+                    self,
+                    "Закрыть вкладку",
+                    "В этом документе есть несохранённые изменения. Закрыть?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+        self._remove_tab(doc)
+
+    def _remove_tab(self, doc: QWidget | None) -> None:
+        if doc is None:
+            return
+        index = self.tabs.indexOf(doc)
+        if index < 0:
+            return
         self.tabs.removeTab(index)
         if isinstance(doc, DocumentView):
             doc.deleteLater()
@@ -252,6 +265,32 @@ class MainWindow(QMainWindow):
         if self.tabs.count() == 0:
             self._show_welcome()
         self._update_actions()
+
+    def _close_converted_doc(self, doc: DocumentView) -> None:
+        """A converted .docx with unsaved edits is closing: offer to keep the
+        work as .md, .docx or .pdf before discarding the throwaway copy."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Закрыть документ Word")
+        source = doc.converted_source()
+        name = source.name if source else "документ"
+        box.setText(f"«{name}» был изменён. Сохранить изменения перед закрытием?")
+        save_md = box.addButton("Сохранить .md", QMessageBox.ButtonRole.AcceptRole)
+        export_docx = box.addButton("Экспорт DOCX", QMessageBox.ButtonRole.AcceptRole)
+        export_pdf = box.addButton("Экспорт PDF", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is save_md:
+            if self._save_converted_as_md(doc):
+                self._remove_tab(doc)
+        elif clicked is export_docx:
+            if self._export_converted_docx(doc):
+                self._remove_tab(doc)
+        elif clicked is export_pdf:
+            self._export_converted_pdf(doc)  # async — closes on completion
+        # Отмена / закрытие диалога: оставляем вкладку открытой.
 
     def close_current_tab(self) -> None:
         if self.tabs.count():
@@ -270,8 +309,10 @@ class MainWindow(QMainWindow):
 
     def open_file(self, path: Path) -> None:
         path = path.resolve()
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            self._error("Неподдерживаемый файл", "Можно открывать только .md и .markdown файлы.")
+        suffix = path.suffix.lower()
+        is_docx = suffix == ".docx"
+        if suffix not in SUPPORTED_EXTENSIONS and not is_docx:
+            self._error("Неподдерживаемый файл", "Можно открывать .md, .markdown и .docx файлы.")
             return
 
         existing = self._tab_for(path)
@@ -285,7 +326,8 @@ class MainWindow(QMainWindow):
         index = self.tabs.addTab(doc, "…")
         self.tabs.setCurrentIndex(index)
         self.right_stack.setCurrentWidget(self.tabs)
-        if not doc.open(path):
+        opened = doc.open_docx(path) if is_docx else doc.open(path)
+        if not opened:
             self.tabs.removeTab(index)
             doc.deleteLater()
             if self.tabs.count() == 0:
@@ -673,6 +715,60 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Сохранено в DOCX: {path}", 6000)
 
+    # ------------------------------------------------- converted docx persist
+
+    def _converted_default(self, doc: DocumentView, suffix: str) -> str:
+        source = doc.converted_source()
+        if source is not None:
+            return str(source.with_suffix(suffix))
+        if doc.current_file is not None:
+            return str(doc.current_file.with_suffix(suffix))
+        return str(Path.home() / f"document{suffix}")
+
+    def _save_converted_as_md(self, doc: DocumentView) -> bool:
+        default = self._converted_default(doc, ".md")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как Markdown", default, "Markdown (*.md)")
+        if not path:
+            return False
+        try:
+            Path(path).write_text(doc.current_markdown_text(), encoding="utf-8")
+        except OSError as exc:
+            self._error("Не удалось сохранить файл", f"{path}\n\n{exc}")
+            return False
+        doc.mark_persisted(Path(path))
+        self._post_open(Path(path).resolve())
+        self.statusBar().showMessage(f"Сохранено: {path}", 6000)
+        return True
+
+    def _export_converted_docx(self, doc: DocumentView) -> bool:
+        default = self._converted_default(doc, ".docx")
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт в Word", default, "Word (*.docx)")
+        if not path:
+            return False
+        try:
+            markdown_to_docx(doc.current_markdown_text(), Path(path), title=Path(path).stem)
+        except ExportError as exc:
+            self._error("Не удалось экспортировать DOCX", str(exc))
+            return False
+        self.statusBar().showMessage(f"Сохранено в DOCX: {path}", 6000)
+        return True
+
+    def _export_converted_pdf(self, doc: DocumentView) -> None:
+        default = self._converted_default(doc, ".pdf")
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт в PDF", default, "PDF (*.pdf)")
+        if not path:
+            return
+        self.statusBar().showMessage("Экспорт в PDF…")
+
+        def _done(ok: bool, result: str) -> None:
+            if ok:
+                self.statusBar().showMessage(f"Сохранено в PDF: {result}", 6000)
+                self._remove_tab(doc)
+            else:
+                self._error("Не удалось экспортировать PDF", result)
+
+        doc.export_pdf_current(path, _done)
+
     # ----------------------------------------------------------- file/folder
 
     def _choose_file(self) -> None:
@@ -683,9 +779,9 @@ class MainWindow(QMainWindow):
             start_dir = str(last or Path.home())
         file_name, _ = QFileDialog.getOpenFileName(
             self,
-            "Открыть Markdown файл",
+            "Открыть файл",
             start_dir,
-            "Markdown files (*.md *.markdown)",
+            "Markdown и Word (*.md *.markdown *.docx);;Markdown (*.md *.markdown);;Word (*.docx)",
         )
         if file_name:
             self.open_file(Path(file_name))

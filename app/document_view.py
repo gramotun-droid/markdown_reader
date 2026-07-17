@@ -10,6 +10,9 @@ file watcher, updates, theme/zoom coordination) stay on the window.
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from functools import partial
 from pathlib import Path
 
@@ -29,9 +32,63 @@ from PySide6.QtWidgets import (
 )
 
 from .editor import MarkdownEditor
+from .import_docx import DocxImportError, docx_to_markdown
 from .renderer import MarkdownRenderer, MarkdownRenderError, read_text_with_fallback
 from .web_editor import WebMarkdownEditor
 from .web_page import MarkdownWebPage
+
+# QWebEngineView.setHtml() serializes the page into a `data:` URL and silently
+# discards it once that URL exceeds 2 MB, leaving a blank page. The cap applies
+# to the *percent-encoded* HTML, not the raw bytes, so a document well under
+# 2 MB of HTML (~800 KB of Markdown and up) can still blow past it once markup
+# is encoded. Anything that would exceed the cap is loaded from a temporary file
+# instead (see DocumentView._display), which has no such limit.
+_DATA_URL_LIMIT = 2 * 1024 * 1024
+# Below this raw size the HTML fits even if every byte percent-encodes to 3
+# bytes, so we can skip the exact (costlier) measurement.
+_SET_HTML_SAFE_BYTES = _DATA_URL_LIMIT // 3
+
+# Hard upper bound on the source file we will render. Bigger files parse and
+# render slowly enough to freeze the UI (and produce HTML the web view struggles
+# with), so we refuse them outright instead.
+_MAX_FILE_BYTES = 10 * 1024 * 1024
+
+
+def _fits_set_html(html: str) -> bool:
+    """Whether *html* will survive QWebEngineView.setHtml(), i.e. its
+    percent-encoded data URL stays under Qt's 2 MB cap."""
+    raw = len(html.encode("utf-8"))
+    if raw < _SET_HTML_SAFE_BYTES:
+        return True
+    from urllib.parse import quote
+
+    return len(quote(html).encode("utf-8")) < _DATA_URL_LIMIT
+
+
+def _cleanup_temp_files(paths: dict[int, Path]) -> None:
+    for path in paths.values():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _cleanup_converted_dir(holder: dict[str, Path]) -> None:
+    directory = holder.get("dir")
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _with_base_href(html: str, base_url: QUrl) -> str:
+    """Inject a <base> tag so relative resources resolve against the document
+    folder even when the HTML is loaded from a temp file elsewhere."""
+    base_tag = f'<base href="{base_url.toString()}">'
+    marker = "<head>"
+    index = html.lower().find(marker)
+    if index == -1:
+        return base_tag + html
+    cut = index + len(marker)
+    return html[:cut] + base_tag + html[cut:]
 
 
 class DocumentView(QWidget):
@@ -40,6 +97,7 @@ class DocumentView(QWidget):
     open_request = Signal(object)  # Path — a link wants another document opened
     missing_link = Signal(object)  # Path
     status_message = Signal(str, int)  # text, timeout ms
+    save_as_requested = Signal()  # converted doc wants a real save location
 
     def __init__(
         self,
@@ -58,8 +116,18 @@ class DocumentView(QWidget):
         self._history: list[Path] = []
         self._history_index = -1
         self._pending_scroll: dict[int, int] = {}
+        self._temp_html: dict[int, Path] = {}
         self._suppress_watch = False
         self._editing = False
+        # Set when this tab holds a .docx converted to Markdown: current_file
+        # then points at a throwaway working copy under a temp dir, and
+        # _converted_from keeps the original .docx path for the close prompt.
+        # The temp dir lives in a mutable holder so it can be cleaned up from
+        # the destroyed signal without touching the (dying) widget.
+        self._converted_from: Path | None = None
+        self._converted_holder: dict[str, Path] = {}
+        self.destroyed.connect(partial(_cleanup_temp_files, self._temp_html))
+        self.destroyed.connect(partial(_cleanup_converted_dir, self._converted_holder))
 
         # editor/preview are created lazily on first edit to avoid spinning up a
         # heavy web view per tab.
@@ -100,6 +168,19 @@ class DocumentView(QWidget):
     def open(self, path: Path, record_history: bool = True) -> bool:
         path = path.resolve()
         try:
+            size = path.stat().st_size
+        except OSError as exc:
+            QMessageBox.warning(self, "Не удалось открыть файл", f"{path}\n\n{exc}")
+            return False
+        if size > _MAX_FILE_BYTES:
+            QMessageBox.warning(
+                self,
+                "Файл слишком большой",
+                f"{path}\n\nРазмер {size / 1024 / 1024:.1f} МБ превышает лимит "
+                f"{_MAX_FILE_BYTES // 1024 // 1024} МБ, файл не открыт.",
+            )
+            return False
+        try:
             rendered = self.renderer.render_file(path)
         except OSError as exc:
             QMessageBox.warning(self, "Не удалось открыть файл", f"{path}\n\n{exc}")
@@ -116,6 +197,71 @@ class DocumentView(QWidget):
         self.title_changed.emit()
         self.state_changed.emit()
         return True
+
+    def open_docx(self, source: Path) -> bool:
+        """Convert a Word .docx to Markdown and open it as an editable, throwaway
+        working copy. The original .docx is never written to."""
+        source = source.resolve()
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            QMessageBox.warning(self, "Не удалось открыть файл", f"{source}\n\n{exc}")
+            return False
+        if size > _MAX_FILE_BYTES:
+            QMessageBox.warning(
+                self,
+                "Файл слишком большой",
+                f"{source}\n\nРазмер {size / 1024 / 1024:.1f} МБ превышает лимит "
+                f"{_MAX_FILE_BYTES // 1024 // 1024} МБ, файл не открыт.",
+            )
+            return False
+        try:
+            markdown_text = docx_to_markdown(source)
+        except DocxImportError as exc:
+            QMessageBox.warning(self, "Не удалось открыть Word-документ", str(exc))
+            return False
+
+        directory = Path(tempfile.mkdtemp(prefix="mdreader-docx-"))
+        working = directory / f"{source.stem}.md"
+        try:
+            working.write_text(markdown_text, encoding="utf-8")
+        except OSError as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            QMessageBox.warning(self, "Не удалось открыть Word-документ", f"{source}\n\n{exc}")
+            return False
+
+        self._converted_from = source
+        self._converted_holder["dir"] = directory
+        return self.open(working, record_history=False)
+
+    def is_converted(self) -> bool:
+        return self._converted_from is not None
+
+    def converted_source(self) -> Path | None:
+        return self._converted_from
+
+    def current_markdown_text(self) -> str:
+        """The document's current Markdown: the live editor buffer while editing,
+        otherwise the working file on disk."""
+        if self._editing and self.editor is not None:
+            return self.editor.text()
+        if self.current_file is not None:
+            try:
+                return read_text_with_fallback(self.current_file)
+            except (OSError, UnicodeDecodeError):
+                return ""
+        return ""
+
+    def mark_persisted(self, path: Path) -> None:
+        """Adopt *path* as the document's real file: it is no longer a converted
+        throwaway copy, so normal save/close semantics apply from now on."""
+        self._converted_from = None
+        self.current_file = path.resolve()
+        self.web_page.current_markdown_path = self.current_file
+        if self.editor is not None:
+            self.editor.mark_saved()
+        self.title_changed.emit()
+        self.state_changed.emit()
 
     def title(self) -> str:
         if self.current_file is None:
@@ -235,7 +381,13 @@ class DocumentView(QWidget):
         return True
 
     def save(self) -> None:
-        if not self.current_file or self.editor is None:
+        if self.editor is None:
+            return
+        if self._converted_from is not None:
+            # A converted .docx has no real file yet — route Ctrl+S to "save as".
+            self.save_as_requested.emit()
+            return
+        if not self.current_file:
             return
         text = self.editor.text()
         try:
@@ -272,6 +424,10 @@ class DocumentView(QWidget):
 
     def has_unsaved(self) -> bool:
         return self._editing and self.editor is not None and self.editor.is_modified()
+
+    def has_edits(self) -> bool:
+        """Whether the editor holds unsaved changes, even outside edit mode."""
+        return self.editor is not None and self.editor.is_modified()
 
     def _release_watch(self) -> None:
         self._suppress_watch = False
@@ -319,7 +475,36 @@ class DocumentView(QWidget):
     def export_pdf(self, dest: str) -> None:
         self.viewer.page().printToPdf(dest)
 
+    def export_pdf_current(self, dest: str, on_done) -> None:
+        """Render the current Markdown (including unsaved edits) into the reading
+        view and print it to *dest*, calling ``on_done(ok, path)`` when finished."""
+        text = self.current_markdown_text()
+        try:
+            html = self.renderer.render_text(text, title=self.title()).html
+        except MarkdownRenderError as exc:
+            on_done(False, str(exc))
+            return
+        base = self.current_file.parent if self.current_file else Path.cwd()
+        self._pdf_export_done = on_done
+        self._pdf_export_dest = dest
+        self.viewer.loadFinished.connect(self._print_current_pdf)
+        if self._editing:
+            self._editing = False
+            self.stack.setCurrentIndex(0)
+        self._display(self.viewer, html, base)
+
+    def _print_current_pdf(self, ok: bool) -> None:
+        try:
+            self.viewer.loadFinished.disconnect(self._print_current_pdf)
+        except (RuntimeError, TypeError):
+            pass
+        self.viewer.page().printToPdf(self._pdf_export_dest)
+
     def _on_pdf_finished(self, path: str, ok: bool) -> None:
+        done = self.__dict__.pop("_pdf_export_done", None)
+        if done is not None:
+            done(ok, path)
+            return
         if ok:
             self.status_message.emit(f"Сохранено в PDF: {path}", 6000)
         else:
@@ -378,7 +563,25 @@ class DocumentView(QWidget):
 
     def _display(self, view: QWebEngineView, html: str, base_dir: Path, scroll_to: int = 0) -> None:
         self._pending_scroll[id(view)] = scroll_to
-        view.setHtml(html, QUrl.fromLocalFile(str(base_dir) + "/"))
+        base_url = QUrl.fromLocalFile(str(base_dir) + "/")
+        if _fits_set_html(html):
+            view.setHtml(html, base_url)
+            return
+        # Too big for setHtml — load from a temp file. A <base> tag keeps
+        # relative links/images resolving against the document folder, just as
+        # setHtml's base URL did.
+        html = _with_base_href(html, base_url)
+        view.load(QUrl.fromLocalFile(str(self._write_temp_html(view, html))))
+
+    def _write_temp_html(self, view: QWebEngineView, html: str) -> Path:
+        path = self._temp_html.get(id(view))
+        if path is None:
+            fd, name = tempfile.mkstemp(prefix="mdreader-", suffix=".html")
+            os.close(fd)
+            path = Path(name)
+            self._temp_html[id(view)] = path
+        path.write_text(html, encoding="utf-8")
+        return path
 
     def _restore_scroll(self, view: QWebEngineView, ok: bool) -> None:
         scroll_to = self._pending_scroll.pop(id(view), 0)
