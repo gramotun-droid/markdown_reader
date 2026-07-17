@@ -10,6 +10,7 @@ from PySide6.QtCore import QUrl  # noqa: E402
 
 from app.document_view import (  # noqa: E402
     _DATA_URL_LIMIT,
+    _SET_HTML_SAFE_BYTES,
     _cleanup_temp_files,
     _fits_set_html,
     _with_base_href,
@@ -20,10 +21,11 @@ def test_fits_set_html_small_document():
     assert _fits_set_html("<head></head><body>hello</body>") is True
 
 
-def test_fits_set_html_rejects_when_encoded_url_exceeds_cap():
-    # Chars that must be percent-encoded triple in size, so raw bytes well under
-    # the cap can still overflow the data: URL that setHtml builds.
-    html = "<head></head>" + "<>&" * 400_000
+def test_fits_set_html_rejects_mid_size_document():
+    # Above the guaranteed-safe size we always take the temp-file path, because
+    # Qt's percent-encoding can push a sub-2 MB page over the data: URL cap
+    # (a ~0.9 MB HTML page was observed to blank out). Raw size alone decides.
+    html = "<head></head>" + "x" * _SET_HTML_SAFE_BYTES
     assert len(html.encode("utf-8")) < _DATA_URL_LIMIT
     assert _fits_set_html(html) is False
 

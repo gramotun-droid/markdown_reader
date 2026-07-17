@@ -39,14 +39,13 @@ from .web_page import MarkdownWebPage
 
 # QWebEngineView.setHtml() serializes the page into a `data:` URL and silently
 # discards it once that URL exceeds 2 MB, leaving a blank page. The cap applies
-# to the *percent-encoded* HTML, not the raw bytes, so a document well under
-# 2 MB of HTML (~800 KB of Markdown and up) can still blow past it once markup
-# is encoded. Anything that would exceed the cap is loaded from a temporary file
-# instead (see DocumentView._display), which has no such limit.
+# to the *percent-encoded* HTML, and Qt escapes more characters than a plain
+# estimate would (so a 0.9 MB page can already overflow). Rather than guess how
+# Qt encodes, we only use setHtml when the raw HTML is small enough that it fits
+# even if *every* byte tripled to a %XX escape; anything larger is loaded from a
+# temporary file instead (see DocumentView._display), which has no size limit.
 _DATA_URL_LIMIT = 2 * 1024 * 1024
-# Below this raw size the HTML fits even if every byte percent-encodes to 3
-# bytes, so we can skip the exact (costlier) measurement.
-_SET_HTML_SAFE_BYTES = _DATA_URL_LIMIT // 3
+_SET_HTML_SAFE_BYTES = _DATA_URL_LIMIT // 3  # worst-case 3x encoding still fits
 
 # Hard upper bound on the source file we will render. Bigger files parse and
 # render slowly enough to freeze the UI (and produce HTML the web view struggles
@@ -55,14 +54,10 @@ _MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
 def _fits_set_html(html: str) -> bool:
-    """Whether *html* will survive QWebEngineView.setHtml(), i.e. its
-    percent-encoded data URL stays under Qt's 2 MB cap."""
-    raw = len(html.encode("utf-8"))
-    if raw < _SET_HTML_SAFE_BYTES:
-        return True
-    from urllib.parse import quote
-
-    return len(quote(html).encode("utf-8")) < _DATA_URL_LIMIT
+    """Whether *html* is guaranteed to survive QWebEngineView.setHtml() — i.e.
+    small enough that its percent-encoded data URL cannot exceed Qt's 2 MB cap
+    no matter how many characters Qt escapes."""
+    return len(html.encode("utf-8")) < _SET_HTML_SAFE_BYTES
 
 
 def _cleanup_temp_files(paths: dict[int, Path]) -> None:
