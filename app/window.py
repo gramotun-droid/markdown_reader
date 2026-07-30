@@ -6,14 +6,13 @@ import threading
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QFileSystemWatcher, QModelIndex, QObject, QProcess, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QModelIndex, QObject, QProcess, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
-    QFileSystemModel,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,6 +38,7 @@ from . import __version__
 from .document_view import DocumentView
 from .drives import available_roots
 from .export import ExportError, markdown_to_docx
+from .file_tree import FileTreeModel
 from .folder_search import search_markdown_files
 from .icon import app_icon
 from .renderer import MarkdownRenderer, read_text_with_fallback
@@ -128,27 +128,26 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings.load()
         self.renderer = MarkdownRenderer(theme=self.settings.theme)
         self.current_folder: Path | None = None
+        # The folder the sidebar tree is rooted at (wiki mode); None means the
+        # full "My Computer" view showing every drive/WSL/network root.
+        self._tree_rooted_at: Path | None = None
         self._use_web_editor = web_editor_available()
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
         self.resize(1220, 820)
 
-        self.file_model = QFileSystemModel(self)
-        self.file_model.setNameFilters(["*.md", "*.markdown"])
-        self.file_model.setNameFilterDisables(False)
-        self.file_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot)
-        # The model loads directories lazily, so revealing a deeply nested file
-        # has to wait for each level to populate; _reveal_target drives that.
-        self._reveal_target: Path | None = None
-        self.file_model.directoryLoaded.connect(self._on_directory_loaded)
+        # Custom model so the sidebar can list WSL distros and network shares as
+        # top-level roots alongside the lettered drives (QFileSystemModel only
+        # ever shows lettered drives at its "My Computer" level).
+        self.file_model = FileTreeModel(SUPPORTED_EXTENSIONS, self)
 
         self.tree = QTreeView(self)
         self.tree.setModel(self.file_model)
         self.tree.setHeaderHidden(True)
         self.tree.clicked.connect(self._on_tree_clicked)
-        for column in range(1, self.file_model.columnCount()):
-            self.tree.hideColumn(column)
+
+        self.sidebar = self._build_sidebar()
 
         # Tabs (one open document each), with a welcome screen shown when empty.
         self.tabs = QTabWidget(self)
@@ -167,7 +166,7 @@ class MainWindow(QMainWindow):
         self.right_stack.addWidget(self.tabs)  # index 1
 
         self.splitter = SidebarSplitter(self)
-        self.splitter.addWidget(self.tree)
+        self.splitter.addWidget(self.sidebar)
         self.splitter.addWidget(self.right_stack)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -181,6 +180,14 @@ class MainWindow(QMainWindow):
         self._watch_timer.setInterval(150)
         self._watch_timer.timeout.connect(self._do_watch_reload)
         self._changed_paths: set[str] = set()
+
+        # QFileSystemWatcher gets no change notifications over WSL/UNC and many
+        # network shares, so also poll the open files' modification time. This is
+        # what makes "saved in another editor" reliably refresh everywhere.
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(1500)
+        self._poll_timer.timeout.connect(self._poll_disk_changes)
+        self._poll_timer.start()
 
         self._create_actions()
         self._create_menus()
@@ -352,10 +359,13 @@ class MainWindow(QMainWindow):
             return
 
         self.current_folder = path
+        self._tree_rooted_at = path
         self.settings.last_path = path
-        root_index = self.file_model.setRootPath(str(path))
-        self.tree.setRootIndex(root_index)
-        self.tree.expand(root_index)
+        self._ensure_tree_roots_cover(path)
+        if not self.file_model.index_for_path(path).isValid():
+            # Exotic path no drive/WSL root contains: show it as its own root.
+            self.file_model.set_roots([(str(path), str(path))])
+        self._apply_tree_root()
         self.folder_search_action.setEnabled(True)
         self.settings.save()
 
@@ -644,6 +654,17 @@ class MainWindow(QMainWindow):
         # Some editors replace files, dropping the watch; re-arm it.
         self._resync_watch()
 
+    def _poll_disk_changes(self) -> None:
+        """Reload any open document whose file changed on disk since we loaded it.
+
+        Backs up the file watcher for paths it cannot observe (WSL/UNC, network
+        shares), so external edits still refresh without a manual click.
+        """
+        for index in range(self.tabs.count()):
+            doc = self.tabs.widget(index)
+            if isinstance(doc, DocumentView) and doc.external_change_pending():
+                doc.refresh()
+
     # ------------------------------------------------------------- recent
 
     def _rebuild_recent_menu(self) -> None:
@@ -793,32 +814,66 @@ class MainWindow(QMainWindow):
             self.open_folder(Path(folder_name))
 
     def _on_tree_clicked(self, index: QModelIndex) -> None:
-        path = Path(self.file_model.filePath(index))
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+        path = self.file_model.path_for_index(index)
+        if path and path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
             self.open_file(path)
 
     def _ensure_tree_for_file(self, path: Path) -> None:
         """Show the directory tree containing the open file and highlight it.
-        For files outside a wiki folder the tree is rooted at the filesystem /
-        drive top so the whole chain of parent folders stays visible."""
-        self._reveal_target = path
-        if not (self.current_folder and _is_within(path, self.current_folder)):
-            self.current_folder = path.parent
-            self.file_model.setRootPath(str(path.parent))
-            self.tree.setRootIndex(QModelIndex())
-            self.folder_search_action.setEnabled(True)
-        self._try_reveal()
+        For files outside a wiki folder the tree is rooted at "My Computer" so
+        the whole chain of parent folders (down from the drive/WSL/network root)
+        stays visible."""
+        self._ensure_tree_roots_cover(path)
+        if self._tree_rooted_at is not None and self.current_folder and _is_within(path, self.current_folder):
+            # Stay within the current wiki folder view, just move the highlight.
+            self._select_file_in_tree(path)
+            return
+        self.current_folder = path.parent
+        self._tree_rooted_at = None
+        self.tree.setRootIndex(QModelIndex())
+        self.folder_search_action.setEnabled(True)
+        self._select_file_in_tree(path)
 
-    def _on_directory_loaded(self, _loaded_path: str) -> None:
-        self._try_reveal()
+    def _ensure_tree_roots_cover(self, path: Path) -> None:
+        """Make sure the tree's roots include a root that contains *path*.
 
-    def _try_reveal(self) -> None:
-        target = self._reveal_target
-        if target is not None and self._select_file_in_tree(target):
-            self._reveal_target = None
+        Roots are only re-enumerated (which resets the tree) when the current
+        set does not already cover *path*, so navigating within an open folder
+        never triggers a costly ``wsl.exe`` call or collapses the tree.
+        """
+        if self.file_model.has_roots() and self.file_model.index_for_path(path).isValid():
+            return
+        self._refresh_tree_roots()
+
+    def _refresh_tree_roots(self) -> None:
+        try:
+            roots = available_roots()
+        except Exception:  # noqa: BLE001 - drive enumeration must never crash the UI
+            roots = []
+        self.file_model.set_roots(roots)
+
+    def _apply_tree_root(self) -> None:
+        """Point the view at the current wiki folder, or at "My Computer"."""
+        if self._tree_rooted_at is not None:
+            index = self.file_model.index_for_path(self._tree_rooted_at)
+            if index.isValid():
+                self.tree.setRootIndex(index)
+                self.tree.expand(index)
+                return
+        self.tree.setRootIndex(QModelIndex())
+
+    def _refresh_tree(self) -> None:
+        """Re-enumerate roots and re-scan the tree, then restore the view and
+        highlight. Picks up files added/removed on disk and newly mounted
+        drives or WSL distros."""
+        self._refresh_tree_roots()
+        self._apply_tree_root()
+        doc = self._active()
+        if doc and doc.current_file:
+            self._select_file_in_tree(doc.current_file)
 
     def _select_file_in_tree(self, path: Path) -> bool:
-        index = self.file_model.index(str(path))
+        index = self.file_model.index_for_path(path)
         if not index.isValid():
             return False
         parent = index.parent()
@@ -828,6 +883,40 @@ class MainWindow(QMainWindow):
         self.tree.setCurrentIndex(index)
         self.tree.scrollTo(index, QTreeView.ScrollHint.PositionAtCenter)
         return True
+
+    def _build_sidebar(self) -> QWidget:
+        """Wrap the tree in a container with a visible "Обновить" button, so a
+        reload after editing in another program is one obvious click away (not
+        just the Ctrl+R / menu action)."""
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QWidget(container)
+        header.setObjectName("sidebarHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.setSpacing(6)
+
+        self.refresh_button = QToolButton(header)
+        self.refresh_button.setObjectName("sidebarRefresh")
+        self.refresh_button.setText("⟳  Обновить")
+        self.refresh_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_button.setToolTip("Перечитать открытый файл и дерево с диска (Ctrl+R)")
+        self.refresh_button.clicked.connect(self._on_refresh_clicked)
+
+        header_layout.addWidget(self.refresh_button)
+        header_layout.addStretch(1)
+
+        layout.addWidget(header)
+        layout.addWidget(self.tree, 1)
+        return container
+
+    def _on_refresh_clicked(self) -> None:
+        self._refresh_active()
+        self._refresh_tree()
 
     def _find_start_file(self, folder: Path) -> Path | None:
         for name in ("index.md", "README.md", "readme.md", "Index.md"):
@@ -906,6 +995,16 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             f"""
             QMainWindow, QWidget {{ background: {c['bg']}; color: {c['text']}; }}
+            QWidget#sidebarHeader {{
+                background: {c['panel']}; border-bottom: 1px solid {c['border']};
+            }}
+            QToolButton#sidebarRefresh {{
+                border: 1px solid {c['border']}; background: {c['bg']};
+                color: {c['text']}; border-radius: 6px; padding: 4px 12px;
+                font-size: 13px;
+            }}
+            QToolButton#sidebarRefresh:hover {{ background: {c['hover']}; border-color: {c['accent']}; }}
+            QToolButton#sidebarRefresh:pressed {{ background: {c['sel']}; }}
             QTreeView {{
                 background: {c['panel']}; border: none; padding: 6px 4px;
                 outline: 0; font-size: 13px;

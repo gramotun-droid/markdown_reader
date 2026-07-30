@@ -60,6 +60,16 @@ def _fits_set_html(html: str) -> bool:
     return len(html.encode("utf-8")) < _SET_HTML_SAFE_BYTES
 
 
+def _safe_mtime(path: Path | None) -> float | None:
+    """The file's modification time, or ``None`` if it cannot be stat-ed."""
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _cleanup_temp_files(paths: dict[int, Path]) -> None:
     for path in paths.values():
         try:
@@ -108,6 +118,9 @@ class DocumentView(QWidget):
         self._zoom_factor = zoom_factor
 
         self.current_file: Path | None = None
+        # Modification time of current_file as of the last load, so we can detect
+        # edits made by other programs (the file watcher is silent on WSL/UNC).
+        self._disk_mtime: float | None = None
         self._history: list[Path] = []
         self._history_index = -1
         self._pending_scroll: dict[int, int] = {}
@@ -185,6 +198,7 @@ class DocumentView(QWidget):
             return False
 
         self.current_file = path
+        self._disk_mtime = _safe_mtime(path)
         self.web_page.current_markdown_path = path
         self._display(self.viewer, rendered.html, path.parent)
         if record_history:
@@ -284,11 +298,20 @@ class DocumentView(QWidget):
         except (OSError, MarkdownRenderError) as exc:
             QMessageBox.warning(self, "Не удалось обновить", str(exc))
             return
+        self._disk_mtime = _safe_mtime(self.current_file)
         self._display(self.viewer, rendered.html, self.current_file.parent, scroll_to=int(scroll_y or 0))
         self.status_message.emit(f"Обновлено: {self.current_file.name}", 2000)
 
     def wants_external_reload(self) -> bool:
         return not self._editing and not self._suppress_watch
+
+    def external_change_pending(self) -> bool:
+        """Whether the file changed on disk since we loaded it and a reload is
+        currently appropriate (not mid-edit, not right after our own save)."""
+        if self.current_file is None or not self.wants_external_reload():
+            return False
+        current = _safe_mtime(self.current_file)
+        return current is not None and current != self._disk_mtime
 
     # ----------------------------------------------------------- navigation
 

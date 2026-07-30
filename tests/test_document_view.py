@@ -13,8 +13,25 @@ from app.document_view import (  # noqa: E402
     _SET_HTML_SAFE_BYTES,
     _cleanup_temp_files,
     _fits_set_html,
+    _safe_mtime,
     _with_base_href,
 )
+
+
+def test_safe_mtime_none_and_missing(tmp_path: Path):
+    assert _safe_mtime(None) is None
+    assert _safe_mtime(tmp_path / "missing.md") is None
+
+
+def test_safe_mtime_reflects_writes(tmp_path: Path):
+    doc = tmp_path / "a.md"
+    doc.write_text("one")
+    first = _safe_mtime(doc)
+    assert first is not None
+    import os
+
+    os.utime(doc, (first + 5, first + 5))
+    assert _safe_mtime(doc) != first
 
 
 def test_fits_set_html_small_document():
