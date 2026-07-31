@@ -38,12 +38,15 @@ def test_scan_dir_orders_dirs_then_files_and_filters(tmp_path: Path):
     assert names == ["Alpha", "zeta", "A.markdown", "b.md"]
 
 
-def test_scan_dir_skips_dotfiles(tmp_path: Path):
-    (tmp_path / ".git").mkdir()
+def test_scan_dir_shows_dot_directories(tmp_path: Path):
+    # A leading dot is not a Windows hidden attribute; dot-named dirs like .tmp
+    # must be listed and navigable, and dot-named markdown files kept.
+    (tmp_path / ".tmp").mkdir()
     (tmp_path / ".secret.md").write_text("x")
     (tmp_path / "visible.md").write_text("x")
+    (tmp_path / "notes.txt").write_text("skip")
     names = [name for name, _p, _d in scan_dir(tmp_path, EXTS)]
-    assert names == ["visible.md"]
+    assert names == [".tmp", ".secret.md", "visible.md"]  # dir first, .txt filtered
 
 
 def test_scan_dir_unreadable_returns_empty(tmp_path: Path):

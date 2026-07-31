@@ -36,16 +36,15 @@ def scan_dir(path: os.PathLike[str] | str, extensions: set[str]) -> list[tuple[s
     Directories come first, then files, each group sorted case-insensitively.
     Directories are always included; files are kept only when their suffix is in
     *extensions* (lower-case, dot-prefixed, e.g. ``{".md", ".markdown"}``).
-    Dot-files and unreadable entries are skipped, and an unreadable directory
-    yields an empty list rather than raising.
+    Dot-named entries (e.g. ``.tmp``) are shown, matching Windows Explorer where
+    a leading dot is not a hidden attribute; an unreadable directory yields an
+    empty list rather than raising.
     """
     dirs: list[str] = []
     files: list[str] = []
     try:
         with os.scandir(path) as iterator:
             for entry in iterator:
-                if entry.name.startswith("."):
-                    continue
                 try:
                     is_dir = entry.is_dir()
                 except OSError:

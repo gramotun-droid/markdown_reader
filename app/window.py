@@ -158,6 +158,9 @@ class MainWindow(QMainWindow):
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._close_tab)
+        tab_bar = self.tabs.tabBar()
+        tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tab_bar.customContextMenuRequested.connect(self._show_tab_context_menu)
 
         self.welcome = QWebEngineView(self)
 
@@ -240,6 +243,31 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         if doc and doc.current_file:
             self._ensure_tree_for_file(doc.current_file)
+
+    def _show_tab_context_menu(self, pos) -> None:
+        tab_bar = self.tabs.tabBar()
+        index = tab_bar.tabAt(pos)
+        if index < 0:
+            return
+        doc = self.tabs.widget(index)
+        path = doc.copy_source_path() if isinstance(doc, DocumentView) else None
+        menu = QMenu(self)
+        if path is not None:
+            actions = (
+                ("Копировать путь к папке", str(path.parent)),
+                ("Копировать полный путь", str(path)),
+                ("Копировать имя файла", path.name),
+            )
+            for label, value in actions:
+                menu.addAction(label).triggered.connect(partial(self._copy_to_clipboard, value))
+        else:
+            unavailable = menu.addAction("Путь недоступен")
+            unavailable.setEnabled(False)
+        menu.exec(tab_bar.mapToGlobal(pos))
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage(f"Скопировано: {text}", 3000)
 
     def _close_tab(self, index: int) -> None:
         doc = self.tabs.widget(index)

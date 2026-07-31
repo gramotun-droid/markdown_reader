@@ -283,6 +283,13 @@ class DocumentView(QWidget):
     def tooltip(self) -> str:
         return str(self.current_file) if self.current_file else ""
 
+    def copy_source_path(self) -> Path | None:
+        """The file path to expose for "copy path" actions. For a converted
+        .docx tab this is the original .docx, not the temp Markdown working copy."""
+        if self._converted_from is not None:
+            return self._converted_from
+        return self.current_file
+
     # -------------------------------------------------------------- refresh
 
     def refresh(self) -> None:
